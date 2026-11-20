@@ -109,6 +109,37 @@ pub fn resample_nearest(
     dst
 }
 
+/// Map a COLMAP landmark from reconstruction pixels into a depth map.
+///
+/// `xy` is in the camera's recorded width and height. A depth map at another
+/// resolution is sampled at the same fractional position, rounded to the
+/// nearest depth pixel. `None` when the mapped pixel is outside the map.
+pub fn depth_pixel_for_landmark(
+    xy: glam::Vec2,
+    camera_width: u32,
+    camera_height: u32,
+    depth_width: usize,
+    depth_height: usize,
+) -> Option<(usize, usize)> {
+    if camera_width == 0
+        || camera_height == 0
+        || depth_width == 0
+        || depth_height == 0
+        || !xy.x.is_finite()
+        || !xy.y.is_finite()
+    {
+        return None;
+    }
+    let u = xy.x * depth_width as f32 / camera_width as f32;
+    let v = xy.y * depth_height as f32 / camera_height as f32;
+    if !u.is_finite() || !v.is_finite() || u < 0.0 || v < 0.0 {
+        return None;
+    }
+    let u = u.round() as usize;
+    let v = v.round() as usize;
+    (u < depth_width && v < depth_height).then_some((u, v))
+}
+
 /// View-space depth of a world point under a COLMAP world-to-camera pose.
 pub fn colmap_camera_depth(rotation_w2c: Quat, translation_w2c: Vec3, xyz: Vec3) -> f32 {
     (rotation_w2c * xyz + translation_w2c).z
@@ -188,6 +219,26 @@ mod tests {
     fn metric_scale_rejects_empty_or_non_positive_pairs() {
         assert_eq!(metric_scale_from_pairs(&[], &[]), None);
         assert_eq!(metric_scale_from_pairs(&[0.0, -2.0], &[1.0, 1.0]), None);
+    }
+
+    #[test]
+    fn landmark_pixels_scale_into_the_depth_map() {
+        // Same resolution: the landmark pixel is unchanged.
+        assert_eq!(
+            depth_pixel_for_landmark(glam::vec2(1.0, 1.0), 4, 3, 4, 3),
+            Some((1, 1))
+        );
+        // Half resolution: camera pixel (2, 2) on an 8×6 image is depth pixel (1, 1).
+        assert_eq!(
+            depth_pixel_for_landmark(glam::vec2(2.0, 2.0), 8, 6, 4, 3),
+            Some((1, 1))
+        );
+        // Indexing the half-resolution map with the raw camera pixel is outside it.
+        assert_eq!(
+            depth_pixel_for_landmark(glam::vec2(2.0, 2.0), 4, 3, 2, 2),
+            Some((1, 1))
+        );
+        assert!(depth_pixel_for_landmark(glam::vec2(-1.0, 0.0), 4, 3, 4, 3).is_none());
     }
 
     #[test]

@@ -33,7 +33,7 @@ For practical guidance on CLI training flags (how to trade off run length, splat
 
 ### Depth supervision
 
-COLMAP datasets can include a `depth` folder of single-channel float32 TIFF depth maps, matched to the RGB images by file stem (`images/frame.png` pairs with `depth/frame.tiff`, or with the same relative subdirectory). A value of `0` marks an invalid pixel. Other dataset formats ignore these files.
+COLMAP datasets can include a `depth` folder of single-channel float32 TIFF depth maps, matched to the RGB images by file stem (`images/frame.png` pairs with `depth/frame.tiff`, or with the same relative subdirectory). A value of `0` marks an invalid pixel. Other dataset formats ignore these files. Depth samples are divided by `--units-per-meter` along with the cameras, so supervision stays in the same units as training. Scale estimation reads the files in their own units first, and samples each landmark at the matching position in the depth map when that map is not the COLMAP camera resolution.
 
 `--depth-loss-weight` (default `0`) adds an L1 loss on inverse depth, `mean(|1/rendered − 1/ground truth|)`, over the valid pixels. Leaving it at `0` keeps the existing training loss and the 4-channel render. The rendered depth is the alpha-weighted sum divided by accumulated alpha, and that alpha is detached so the loss moves gaussians instead of changing opacity.
 

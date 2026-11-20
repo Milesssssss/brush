@@ -229,7 +229,7 @@ impl DepthPreviewLoader {
 
 async fn load_depth_preview(depth: LoadDepth, ctx: egui::Context, edge: u32) -> Option<DepthFrame> {
     let path = depth.path().to_path_buf();
-    let (samples, width, height) = depth.load_native().await.ok()?;
+    let (samples, width, height) = depth.load_in_scene_units().await.ok()?;
     let long_edge = width.max(height).max(1);
     let (preview, preview_w, preview_h) = if long_edge > edge as usize {
         let scale = edge as f32 / long_edge as f32;

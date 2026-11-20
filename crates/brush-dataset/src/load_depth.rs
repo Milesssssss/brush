@@ -12,22 +12,36 @@ use tokio::io::AsyncReadExt;
 use crate::depth::resample_nearest;
 
 /// Lazily loaded per-view depth map.
+///
+/// `to_scene` converts file samples into the units training uses
+/// (`1 / units_per_meter`). Scale estimation reads [`Self::load_native`],
+/// which stays in the file's own units.
 #[derive(Clone, Debug)]
 pub struct LoadDepth {
     vfs: Arc<BrushVfs>,
     path: PathBuf,
+    to_scene: f32,
 }
 
 impl LoadDepth {
-    pub fn new(vfs: Arc<BrushVfs>, path: PathBuf) -> Self {
-        Self { vfs, path }
+    pub fn new(vfs: Arc<BrushVfs>, path: PathBuf, units_per_meter: f32) -> Self {
+        let to_scene = if units_per_meter.is_finite() && units_per_meter > 0.0 {
+            1.0 / units_per_meter
+        } else {
+            1.0
+        };
+        Self {
+            vfs,
+            path,
+            to_scene,
+        }
     }
 
     pub fn path(&self) -> &Path {
         &self.path
     }
 
-    /// Decode the file at its native resolution: `(samples, width, height)`.
+    /// Decode the file at its native resolution, in the file's own units.
     pub async fn load_native(&self) -> Result<(Vec<f32>, usize, usize), LoadDepthError> {
         let mut bytes = Vec::new();
         self.vfs
@@ -38,7 +52,18 @@ impl LoadDepth {
         decode_f32_tiff(&bytes)
     }
 
-    /// Decode and nearest-resample to `[height, width]`, matching a training image.
+    /// [`Self::load_native`] multiplied into the training scene's units.
+    pub async fn load_in_scene_units(&self) -> Result<(Vec<f32>, usize, usize), LoadDepthError> {
+        let (mut samples, width, height) = self.load_native().await?;
+        if self.to_scene != 1.0 {
+            for sample in &mut samples {
+                *sample *= self.to_scene;
+            }
+        }
+        Ok((samples, width, height))
+    }
+
+    /// Decode, convert into scene units, and nearest-resample to `[height, width]`.
     pub async fn load_resized(
         &self,
         height: usize,
@@ -49,7 +74,7 @@ impl LoadDepth {
                 "depth target size must be non-zero".to_owned(),
             ));
         }
-        let (samples, src_w, src_h) = self.load_native().await?;
+        let (samples, src_w, src_h) = self.load_in_scene_units().await?;
         let samples = resample_nearest(&samples, src_w, src_h, width, height);
         Ok(TensorData::new(samples, [height, width]))
     }

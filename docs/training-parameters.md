@@ -108,7 +108,7 @@ Off unless you opt in. Existing runs are unchanged.
 | `--depth-loss-weight` | `0` | Inverse-depth L1 against COLMAP `depth/*.tiff` maps. `0` disables the loss and the extra render channel. |
 | `--estimate-metric-scale` | off | One global scale from those depth maps and projected landmarks. Skipped when no depth maps are present. `--units-per-meter` still applies afterwards. |
 
-Depth maps are single-channel float32 TIFFs. `0` means invalid. Match the RGB stem: `images/frame.png` → `depth/frame.tiff`.
+Depth maps are single-channel float32 TIFFs. `0` means invalid. Match the RGB stem: `images/frame.png` → `depth/frame.tiff`. Values are divided by `--units-per-meter` before the loss, matching the scaled cameras. `--estimate-metric-scale` samples landmarks in the depth map's own resolution.
 
 ## Learning rates and loss (usually leave alone)
 

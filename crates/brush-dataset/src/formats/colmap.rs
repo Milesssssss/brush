@@ -8,7 +8,7 @@ use super::{DatasetLoadResult, FormatError};
 use crate::{
     Dataset,
     config::LoadDatasetConfig,
-    depth::{colmap_camera_depth, metric_scale_from_pairs},
+    depth::{colmap_camera_depth, depth_pixel_for_landmark, metric_scale_from_pairs},
     formats::{
         find_depth_path, find_image_by_name, find_mask_path, find_points3d_path, split_eval_every,
     },
@@ -172,7 +172,14 @@ async fn load_dataset_inner(
         // the landmarks up with those maps. The flag alone does not change
         // the scene.
         let metric_scale = if load_args.estimate_metric_scale {
-            match estimate_metric_scale(&vfs, &img_info_list, &points_dir_for_scale).await {
+            match estimate_metric_scale(
+                &vfs,
+                &img_info_list,
+                &cam_model_data,
+                &points_dir_for_scale,
+            )
+            .await
+            {
                 Ok(scale) => {
                     log::info!(
                         "Rescaling COLMAP reconstruction into depth-map units (scale = {scale})"
@@ -222,8 +229,8 @@ async fn load_dataset_inner(
             };
 
             let mask_path = find_mask_path(&vfs, path);
-            let depth =
-                find_depth_path(&vfs, path).map(|p| LoadDepth::new(vfs.clone(), p.to_path_buf()));
+            let depth = find_depth_path(&vfs, path)
+                .map(|p| LoadDepth::new(vfs.clone(), p.to_path_buf(), load_args.units_per_meter));
 
             // Convert w2c to c2w. `pose_scale` is 1 unless metric scale
             // estimation produced a finite positive scale.
@@ -359,6 +366,7 @@ async fn load_dataset_inner(
 async fn estimate_metric_scale(
     vfs: &Arc<BrushVfs>,
     images: &[colmap_reader::Image],
+    cameras: &HashMap<i32, ColmapCamera>,
     points_dir: &Path,
 ) -> Result<f32, String> {
     let depth_views: Vec<_> = images
@@ -397,12 +405,17 @@ async fn estimate_metric_scale(
         let Some(point_data) = &img.points else {
             continue;
         };
-        let loader = LoadDepth::new(vfs.clone(), depth_path.to_path_buf());
+        // File units, not training metres. `units_per_meter` is applied to
+        // the geometry and to the training depth targets afterwards.
+        let loader = LoadDepth::new(vfs.clone(), depth_path.to_path_buf(), 1.0);
         let Ok((depth, width, height)) = loader.load_native().await else {
             log::warn!(
                 "Skipping depth map {} while estimating scale",
                 depth_path.display()
             );
+            continue;
+        };
+        let Some(camera) = cameras.get(&img.camera_id) else {
             continue;
         };
         for (xy, &pid) in point_data.xys.iter().zip(point_data.point3d_ids.iter()) {
@@ -412,13 +425,19 @@ async fn estimate_metric_scale(
             let Some(&xyz) = point_map.get(&pid) else {
                 continue;
             };
-            let u = xy.x.round() as isize;
-            let v = xy.y.round() as isize;
-            if u < 0 || v < 0 || (u as usize) >= width || (v as usize) >= height {
+            // Landmarks are in the COLMAP camera's pixel grid. The depth
+            // map may be a different resolution.
+            let Some((u, v)) = depth_pixel_for_landmark(
+                *xy,
+                camera.width as u32,
+                camera.height as u32,
+                width,
+                height,
+            ) else {
                 continue;
-            }
+            };
             colmap_depths.push(colmap_camera_depth(img.quat, img.tvec, xyz));
-            metric_depths.push(depth[v as usize * width + u as usize]);
+            metric_depths.push(depth[v * width + u]);
         }
     }
 
@@ -895,6 +914,135 @@ mod tests {
         assert_vec3_close(
             result.dataset.train.views[0].camera.position,
             glam::vec3(-1.0, -2.0, -3.0),
+        );
+    }
+
+    /// Camera is 8×6. The landmark sits at camera pixel (2, 2), which is
+    /// depth pixel (1, 1) on the 4×3 map. Indexing the map with (2, 2) would
+    /// read a zero and drop the correspondence.
+    #[tokio::test]
+    async fn metric_scale_samples_landmarks_in_depth_map_pixels() {
+        let dir = tempfile::tempdir().unwrap();
+        let sparse = dir.path().join("sparse/0");
+        tokio::fs::create_dir_all(&sparse).await.unwrap();
+        tokio::fs::write(
+            sparse.join("cameras.txt"),
+            "# Camera list with one line of data per camera:\n\
+             #   CAMERA_ID, MODEL, WIDTH, HEIGHT, PARAMS[]\n\
+             1 PINHOLE 8 6 8.0 8.0 4.0 3.0\n",
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            sparse.join("images.txt"),
+            "# Image list with two lines of data per image:\n\
+             #   IMAGE_ID, QW, QX, QY, QZ, TX, TY, TZ, CAMERA_ID, NAME\n\
+             #   POINTS2D[] as (X, Y, POINT3D_ID)\n\
+             1 1 0 0 0 0 0 -5 1 view.png\n\
+             2 2 1\n",
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            sparse.join("points3D.txt"),
+            "# 3D point list with one line of data per point:\n\
+             #   POINT3D_ID, X, Y, Z, R, G, B, ERROR, TRACK[] as (IMAGE_ID, POINT2D_IDX)\n\
+             1 0 0 10 255 0 0 0.1 1 0\n",
+        )
+        .await
+        .unwrap();
+        let images = dir.path().join("images");
+        tokio::fs::create_dir_all(&images).await.unwrap();
+        image::RgbImage::from_pixel(4, 3, image::Rgb([10, 20, 30]))
+            .save(images.join("view.png"))
+            .unwrap();
+        let mut samples = vec![0.0f32; 4 * 3];
+        samples[5] = 10.0;
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        tiff::encoder::TiffEncoder::new(&mut bytes)
+            .unwrap()
+            .write_image::<tiff::encoder::colortype::Gray32Float>(4, 3, &samples)
+            .unwrap();
+        let depth_dir = dir.path().join("depth");
+        tokio::fs::create_dir_all(&depth_dir).await.unwrap();
+        tokio::fs::write(depth_dir.join("view.tiff"), bytes.into_inner())
+            .await
+            .unwrap();
+
+        let scaled = load_dataset(
+            Arc::new(BrushVfs::from_path(dir.path()).await.unwrap()),
+            &LoadDatasetConfig {
+                estimate_metric_scale: true,
+                ..test_config(None)
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            scaled.warnings.is_empty(),
+            "warnings: {:?}",
+            scaled.warnings
+        );
+        assert_vec3_close(
+            scaled.dataset.train.views[0].camera.position,
+            glam::vec3(0.0, 0.0, 10.0),
+        );
+    }
+
+    #[tokio::test]
+    async fn depth_targets_follow_units_per_meter() {
+        let dir = tempfile::tempdir().unwrap();
+        write_metric_depth_dataset(dir.path()).await;
+        // Overwrite the depth map with a millimetre reading of the same pixel.
+        let mut samples = vec![0.0f32; 4 * 3];
+        samples[5] = 1000.0;
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        tiff::encoder::TiffEncoder::new(&mut bytes)
+            .unwrap()
+            .write_image::<tiff::encoder::colortype::Gray32Float>(4, 3, &samples)
+            .unwrap();
+        tokio::fs::write(dir.path().join("depth/view.tiff"), bytes.into_inner())
+            .await
+            .unwrap();
+
+        let result = load_dataset(
+            Arc::new(BrushVfs::from_path(dir.path()).await.unwrap()),
+            &LoadDatasetConfig {
+                estimate_metric_scale: true,
+                units_per_meter: 1000.0,
+                ..test_config(None)
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            result.warnings.is_empty(),
+            "warnings: {:?}",
+            result.warnings
+        );
+        // Raw scale is 1000/5 = 200, then positions are divided by 1000.
+        assert_vec3_close(
+            result.dataset.train.views[0].camera.position,
+            glam::vec3(0.0, 0.0, 1.0),
+        );
+        let init = result.init_splat.expect("initial points");
+        assert_vec3_close(
+            glam::Vec3::from_slice(&init.data.means[0..3]),
+            glam::vec3(0.0, 0.0, 2.0),
+        );
+        let depth = result.dataset.train.views[0]
+            .depth
+            .as_ref()
+            .unwrap()
+            .load_resized(3, 4)
+            .await
+            .unwrap()
+            .try_to_vec::<f32>()
+            .unwrap();
+        assert!(
+            (depth[5] - 1.0).abs() < 1e-5,
+            "training depth should be in metres, got {}",
+            depth[5]
         );
     }
 }
