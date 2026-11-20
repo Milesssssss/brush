@@ -29,6 +29,14 @@ use tracing::{Instrument, trace_span};
 
 pub const BOUND_PERCENTILE: f32 = 0.8;
 
+/// Fraction of a training phase after which refine and the opacity reset both
+/// stop, so the tail of the phase can settle.
+pub const REFINE_STOP_PROGRESS: f32 = 0.95;
+
+/// Activated-opacity cap used by [`SplatTrainer::reset_opacity`].
+/// `sigmoid(raw)` is clamped with `min(a, OPACITY_RESET_MAX)`.
+pub const OPACITY_RESET_MAX: f32 = 0.01;
+
 /// Fraction of training after which the Mip-Splatting 3D-filter floor stops
 /// being recomputed and is held frozen (still applied), so splats settle
 /// against a fixed target instead of chasing a moving floor.
@@ -120,6 +128,30 @@ pub struct SplatTrainer {
 
 fn inv_sigmoid(x: Tensor<1>) -> Tensor<1> {
     (x.clone() / (1.0f32 - x)).log()
+}
+
+/// Host-side `inv_sigmoid(OPACITY_RESET_MAX)`. Every clamped splat is written
+/// to this exact value, so the cap does not depend on a per-element GPU log.
+fn opacity_reset_raw_value() -> f32 {
+    (OPACITY_RESET_MAX / (1.0 - OPACITY_RESET_MAX)).ln()
+}
+
+/// `min(sigmoid(raw), OPACITY_RESET_MAX)`, written back through `inv_sigmoid`.
+/// Rows already at or below the cap keep their raw bits (no sigmoid round-trip).
+fn clamp_raw_opacity(raw: Tensor<1>) -> Tensor<1> {
+    let above = sigmoid(raw.clone()).greater_elem(OPACITY_RESET_MAX);
+    let reset_raw = Tensor::zeros(raw.dims(), &raw.device()).add_scalar(opacity_reset_raw_value());
+    raw.mask_where(above, reset_raw)
+}
+
+/// Same bookends as the refine gate in the training loop: not at iteration 0,
+/// only on multiples of `every`, and not in the last 5% of the phase.
+/// `every == 0` is off.
+fn opacity_reset_due(phase_iter: u32, phase_progress: f32, every: u32) -> bool {
+    every > 0
+        && phase_iter > 0
+        && phase_iter.is_multiple_of(every)
+        && phase_progress <= REFINE_STOP_PROGRESS
 }
 
 /// Per-splat world-space scale floor for the Mip-Splatting 3D filter:
@@ -230,6 +262,36 @@ impl SplatTrainer {
     /// Percentile bounding box of the splats, refreshed on each refine.
     pub fn bounds(&self) -> BoundingBox {
         self.bounds
+    }
+
+    /// Whether this phase iteration should clamp opacity and zero its Adam moments.
+    ///
+    /// Follows the refine schedule: skipped at phase iteration 0, only when
+    /// `phase_iter` is a multiple of [`TrainConfig::opacity_reset_every`], and
+    /// not once the phase passes [`REFINE_STOP_PROGRESS`]. `N` does not have
+    /// to be a multiple of `refine_every`; the training loop applies the reset
+    /// after prune/split on steps where both are due.
+    pub fn opacity_reset_due(&self, phase_iter: u32, phase_progress: f32) -> bool {
+        opacity_reset_due(phase_iter, phase_progress, self.config.opacity_reset_every)
+    }
+
+    /// Clamp activated opacity to at most [`OPACITY_RESET_MAX`] and replace
+    /// the opacity Adam moments with zeros.
+    ///
+    /// The Adam step counter is left unchanged. That matches replacing the
+    /// parameter tensor in the optimizer: `exp_avg` / `exp_avg_sq` are cleared
+    /// and the bias-correction step is kept, so the next updates do not
+    /// immediately undo the clamp. Moments for means, scales, rotation, and
+    /// SH are not touched. A missing optimizer (no step yet) still clamps the
+    /// parameters; the next step then starts from fresh moments.
+    pub fn reset_opacity(&mut self, mut splats: Splats) -> Splats {
+        splats.raw_opacities = splats.raw_opacities.map(clamp_raw_opacity);
+        if let Some(optim) = self.optim.as_mut() {
+            optim
+                .opacities
+                .map_momentum(|moment| Tensor::zeros(moment.dims(), &moment.device()));
+        }
+        splats
     }
 
     /// Supply per-train-view (world center, focal-px at native res) to enable
@@ -826,15 +888,22 @@ impl SplatTrainer {
             );
         }
 
-        let train_t = (iter as f32 / self.config.total_train_iters.max(1) as f32).clamp(0.0, 1.0);
-        let t_shrink_strength = 1.0 - train_t;
-        let minus_opac = self.config.opac_decay * t_shrink_strength;
+        // The periodic reset is the opt-in replacement for this subtractive
+        // decay. Running both would stack two downward pressures, so decay
+        // runs only while the reset is off. With the default (`0`) this block
+        // is exactly the previous refine path.
+        if self.config.opacity_reset_every == 0 {
+            let train_t =
+                (iter as f32 / self.config.total_train_iters.max(1) as f32).clamp(0.0, 1.0);
+            let t_shrink_strength = 1.0 - train_t;
+            let minus_opac = self.config.opac_decay * t_shrink_strength;
 
-        // Lower opacity slowly over time.
-        splats.raw_opacities = splats.raw_opacities.map(|f| {
-            let new_opac = sigmoid(f) - minus_opac;
-            inv_sigmoid(new_opac.clamp(1e-12, 1.0 - 1e-12))
-        });
+            // Lower opacity slowly over time.
+            splats.raw_opacities = splats.raw_opacities.map(|f| {
+                let new_opac = sigmoid(f) - minus_opac;
+                inv_sigmoid(new_opac.clamp(1e-12, 1.0 - 1e-12))
+            });
+        }
 
         self.optim = Some(optim);
         splats
@@ -925,4 +994,234 @@ fn sample_background_color<R: rand::Rng + ?Sized>(
         rng.random_range(-strength..strength),
     );
     (base + noise).clamp(glam::Vec3::ZERO, glam::Vec3::ONE)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::adam_scaled::MomentumState;
+    use brush_render::gaussian_splats::SplatRenderMode;
+    use hashbrown::HashSet;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
+
+    async fn to_vec<const D: usize>(t: Tensor<D>) -> Vec<f32> {
+        t.into_data_async()
+            .await
+            .expect("tensor readback")
+            .try_into_vec::<f32>()
+            .expect("f32 tensor")
+    }
+
+    fn test_trainer(config: &TrainConfig, device: &Device) -> SplatTrainer {
+        SplatTrainer::new_seeded(
+            config,
+            device,
+            BoundingBox {
+                center: glam::Vec3::ZERO,
+                extent: glam::Vec3::ONE,
+            },
+            1,
+        )
+    }
+
+    fn splats_with_opacity(device: &Device, raw: &[f32]) -> Splats {
+        let n = raw.len();
+        Splats::from_tensor_data(
+            Tensor::zeros([n, 3], device),
+            Tensor::ones([n, 4], device),
+            Tensor::zeros([n, 3], device),
+            Tensor::zeros([n, 1, 3], device),
+            Tensor::<1>::from_floats(raw, device),
+            SplatRenderMode::Default,
+        )
+    }
+
+    #[test]
+    fn opacity_reset_schedule_matches_refine_gate() {
+        let off = TrainConfig::default().opacity_reset_every;
+        assert_eq!(off, 0);
+        for iter in [0, 1, 200, 3000, 28_500] {
+            assert!(
+                !opacity_reset_due(iter, 0.5, off),
+                "default flag must never reset at iter {iter}"
+            );
+        }
+
+        assert!(
+            !opacity_reset_due(0, 0.0, 3000),
+            "iteration 0 is not a reset"
+        );
+        assert!(!opacity_reset_due(2999, 0.1, 3000));
+        assert!(opacity_reset_due(3000, 0.1, 3000));
+        assert!(
+            opacity_reset_due(3000, REFINE_STOP_PROGRESS, 3000),
+            "the refine cutoff itself still resets"
+        );
+        assert!(
+            !opacity_reset_due(3000, REFINE_STOP_PROGRESS + 0.001, 3000),
+            "past the refine cutoff does not reset"
+        );
+        // `N` does not have to coincide with a refine step.
+        assert!(opacity_reset_due(250, 0.01, 250));
+        assert!(!opacity_reset_due(250, 0.01, 200));
+    }
+
+    #[wasm_bindgen_test(unsupported = tokio::test)]
+    async fn opacity_reset_clamps_and_zeroes_only_opacity_moments() {
+        let device: Device = brush_cube::test_helpers::test_device().await.into();
+        let opt_device = device.clone().inner();
+        let config = TrainConfig {
+            opacity_reset_every: 3000,
+            ..TrainConfig::default()
+        };
+
+        // 0.0 → opacity 0.5 and 2.0 → ~0.88 are above the cap.
+        // The cap raw value is the boundary. -5 and -6 stay below it.
+        let cap_raw = opacity_reset_raw_value();
+        let raw = [0.0f32, 2.0, cap_raw, -5.0, -6.0];
+        let n = raw.len();
+        let splats = splats_with_opacity(&device, &raw);
+
+        let mut trainer = test_trainer(&config, &device);
+        assert!(trainer.opacity_reset_due(3000, 0.5));
+        assert!(!trainer.opacity_reset_due(200, 0.5));
+        assert!(!trainer.opacity_reset_due(0, 0.0));
+
+        let mut optim = SplatOptim::new(&config, splats.sh_degree(), &opt_device);
+        optim.opacities.momentum = Some(MomentumState {
+            moment_1: Tensor::<1>::from_floats([1.0, -2.0, 3.0, -4.0, 5.0], &opt_device),
+            moment_2: Tensor::<1>::from_floats([0.5, 0.25, 0.125, 0.0625, 0.03125], &opt_device),
+            time: 42,
+        });
+        let transform_m1 = Tensor::<2>::ones([n, 10], &opt_device);
+        let transform_m2 = Tensor::<2>::ones([n, 10], &opt_device).mul_scalar(0.5);
+        let transform_m1_before = to_vec(transform_m1.clone()).await;
+        let transform_m2_before = to_vec(transform_m2.clone()).await;
+        optim.transforms.momentum = Some(MomentumState {
+            moment_1: transform_m1,
+            moment_2: transform_m2,
+            time: 7,
+        });
+        trainer.optim = Some(optim);
+
+        let splats = trainer.reset_opacity(splats);
+        let got = to_vec(splats.raw_opacities.val()).await;
+        assert_eq!(got.len(), n);
+        assert_eq!(
+            got[0].to_bits(),
+            cap_raw.to_bits(),
+            "opacity 0.5 is clamped"
+        );
+        assert_eq!(
+            got[1].to_bits(),
+            cap_raw.to_bits(),
+            "opacity ~0.88 is clamped"
+        );
+        assert_eq!(
+            got[2].to_bits(),
+            cap_raw.to_bits(),
+            "the cap itself is unchanged"
+        );
+        assert_eq!(
+            got[3].to_bits(),
+            (-5.0f32).to_bits(),
+            "below the cap is kept"
+        );
+        assert_eq!(
+            got[4].to_bits(),
+            (-6.0f32).to_bits(),
+            "below the cap is kept"
+        );
+
+        let optim = trainer.optim.as_ref().expect("optim still installed");
+        let opac = optim
+            .opacities
+            .momentum
+            .as_ref()
+            .expect("opacity moments exist");
+        assert_eq!(opac.time, 42, "adam step counter is kept");
+        for v in to_vec(opac.moment_1.clone()).await {
+            assert_eq!(v.to_bits(), 0, "exp_avg zeroed");
+        }
+        for v in to_vec(opac.moment_2.clone()).await {
+            assert_eq!(v.to_bits(), 0, "exp_avg_sq zeroed");
+        }
+        let transforms = optim
+            .transforms
+            .momentum
+            .as_ref()
+            .expect("transform moments");
+        assert_eq!(transforms.time, 7, "other parameters keep their step");
+        assert_eq!(
+            to_vec(transforms.moment_1.clone()).await,
+            transform_m1_before,
+            "mean/scale/rotation moments are not zeroed"
+        );
+        assert_eq!(
+            to_vec(transforms.moment_2.clone()).await,
+            transform_m2_before,
+            "mean/scale/rotation second moments are not zeroed"
+        );
+
+        // No optimizer yet: the clamp still happens.
+        let mut bare = test_trainer(&config, &device);
+        assert!(bare.optim.is_none());
+        let again = bare.reset_opacity(splats_with_opacity(&device, &raw));
+        let got = to_vec(again.raw_opacities.val()).await;
+        assert_eq!(got[0].to_bits(), cap_raw.to_bits());
+        assert_eq!(got[3].to_bits(), (-5.0f32).to_bits());
+        assert!(bare.optim.is_none());
+    }
+
+    #[wasm_bindgen_test(unsupported = tokio::test)]
+    async fn opacity_reset_disables_opac_decay_inside_refine() {
+        let device: Device = brush_cube::test_helpers::test_device().await.into();
+        let opt_device = device.clone().inner();
+        let n = 4;
+        // raw 0 is sigmoid 0.5. At iter 0 the full `opac_decay` is subtracted.
+        let raw = [0.0f32; 4];
+
+        let decay_config = TrainConfig {
+            opac_decay: 0.2,
+            ..TrainConfig::default()
+        };
+        let mut decay_trainer = test_trainer(&decay_config, &device);
+        let decayed = decay_trainer.refine_splats(
+            &device,
+            SplatOptim::new(&decay_config, 0, &opt_device),
+            splats_with_opacity(&device, &raw),
+            HashSet::new(),
+            Tensor::zeros([n], &device),
+            0,
+        );
+        let decayed_raw = to_vec(decayed.raw_opacities.val()).await;
+        let decayed_opac = 1.0 / (1.0 + (-decayed_raw[0]).exp());
+        assert!(
+            (decayed_opac - 0.3).abs() < 1e-4,
+            "decay subtracts opac_decay at iter 0, got activated {decayed_opac}"
+        );
+
+        let reset_config = TrainConfig {
+            opacity_reset_every: 3000,
+            ..decay_config
+        };
+        let mut reset_trainer = test_trainer(&reset_config, &device);
+        let kept = reset_trainer.refine_splats(
+            &device,
+            SplatOptim::new(&reset_config, 0, &opt_device),
+            splats_with_opacity(&device, &raw),
+            HashSet::new(),
+            Tensor::zeros([n], &device),
+            0,
+        );
+        for v in to_vec(kept.raw_opacities.val()).await {
+            assert_eq!(
+                v.to_bits(),
+                0,
+                "decay is skipped while the reset is enabled"
+            );
+        }
+    }
 }

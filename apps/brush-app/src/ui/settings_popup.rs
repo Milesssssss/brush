@@ -209,6 +209,14 @@ fn draw_training(ui: &mut Ui, args: &mut TrainStreamConfig, enabled: bool) {
         );
         slider(
             ui,
+            &mut tc.opacity_reset_every,
+            0..=30000,
+            "Opacity reset interval (0 off)",
+            false,
+            enabled,
+        );
+        slider(
+            ui,
             &mut tc.match_alpha_weight,
             0.01..=1.0,
             "Alpha match weight",
