@@ -7,6 +7,7 @@ use crate::{
     multinomial::multinomial_sample,
     quat_vec::quaternion_vec_multiply,
     splat_init::bounds_from_pos,
+    split::{MIN_OPACITY, MIN_SPLIT_K, SPLIT_OPACITY_EPS},
     stats::RefineRecord,
 };
 use brush_dataset::scene::SceneBatch;
@@ -27,8 +28,6 @@ use rand::SeedableRng;
 use tracing::{Instrument, trace_span};
 
 pub const BOUND_PERCENTILE: f32 = 0.8;
-
-const MIN_OPACITY: f32 = 1.0 / 255.0;
 
 /// Fraction of training after which the Mip-Splatting 3D-filter floor stops
 /// being recomputed and is held frozen (still applied), so splats settle
@@ -568,8 +567,9 @@ impl SplatTrainer {
 
         // Force-split splats that are too big on screen (every refine). Rather
         // than killing them (the old `kill_at_screen_size`), we split them and
-        // shrink the children down to `split_at_screen_size` on screen — see
-        // `refine_splats`. Capped by the remaining `max_splats` budget.
+        // shrink the children. One split at most halves an axis; later refines
+        // bring them down to `split_at_screen_size`. Capped by the remaining
+        // `max_splats` budget.
         let pre_oversized = split_inds.len();
         if self.config.split_at_screen_size > 0.0 {
             let oversized = refiner.above_screen_size(self.config.split_at_screen_size);
@@ -638,8 +638,8 @@ impl SplatTrainer {
 
         let num_split_high_grad = (split_inds.len() - pre_high_grad) as u32;
         let refine_count = split_inds.len();
-        // Per-splat max on-screen extent, used by `refine_splats` to cap the
-        // split shrink so oversized splats' children land at `split_at_screen_size`.
+        // Per-splat max on-screen extent. `refine_splats` uses it to shrink
+        // oversized splats, floored so one refine cannot throw them apart.
         let screen_sizes = refiner.max_screen_size.clone();
         splats = self.refine_splats(&device, optim, splats, split_inds, screen_sizes, iter);
 
@@ -710,24 +710,37 @@ impl SplatTrainer {
 
             let cur_opac = sigmoid(cur_raw_opac);
             let inv_opac: Tensor<1> = 1.0 - cur_opac;
-            // Post-split child opacity as a power law in transmittance,
-            // p = 0.5 would keep the transmittance for cloning splats but as we offset them
-            // choose a higher p.
+            // Child opacity `1 - (1-a)^(1/√2)`. p = 1/2 would preserve
+            // transmittance for fully overlapping clones; the children are
+            // offset, so use the higher exponent. Clamp only so `inv_sigmoid`
+            // stays finite. Do not lift the result to `MIN_OPACITY`: that is
+            // the prune threshold, and a parent below about 0.0055 would
+            // otherwise come back as two children sitting exactly on it.
             let new_opac: Tensor<1> = 1.0 - inv_opac.powf_scalar(FRAC_1_SQRT_2);
-            let new_raw_opac = inv_sigmoid(new_opac.clamp(MIN_OPACITY, 1.0 - MIN_OPACITY));
+            let new_raw_opac = inv_sigmoid(new_opac.clamp(SPLIT_OPACITY_EPS, 1.0 - MIN_OPACITY));
 
-            // Smooth covariance-aware split. Per-axis shrink + mass-conserving
-            // deterministic offset (one child at +offset, the other at -offset).
-            // Children inherit the
-            // parent's rotation; the split is the scale shrink + ±offset.
+            // Smooth covariance-aware split. Per-axis shrink + second-moment
+            // offset (one child at +offset, the other at -offset):
+            //   k_i = 1 - (1 - k) · (σ_i² / σ_max²)
+            //   offset_i = √(1 - k_i²) · σ_i
+            // so each axis's mixture variance matches the parent. At the
+            // ordinary k = 1/√2 the children sit two child standard deviations
+            // apart, which is what the opacity exponent assumes, and a needle's
+            // long axis grows to √2 σ. Replacing the offset with `(1-k)·σ`
+            // would stop that growth but also move every ordinary split from
+            // ±0.707σ to ±0.293σ, so the offset stays. Children inherit the
+            // parent's rotation.
             let cur_scales_sq = cur_scales.clone().powi_scalar(2);
             let max_scale_sq = cur_scales_sq.clone().max_dim(1).clamp_min(1e-30);
             let ratio = cur_scales_sq / max_scale_sq;
-            // Max-axis shrink factor `k` (per splat). The standard split uses
-            // 1/√2 (mass-conserving). When `split_at_screen_size` is set, splats
-            // that are too big on screen shrink harder so their children land at
-            // (at most) the cap: `k = min(1/√2, split_at_screen_size / screen)`.
-            // Splats already within √2× of the cap are unaffected (min → 1/√2).
+            // Longest-axis shrink `k`. The ordinary split uses 1/√2. With
+            // `split_at_screen_size` set, an on-screen giant shrinks harder,
+            // but never below 1/2:
+            // `k = clamp(split_at / screen, MIN_SPLIT_K, 1/√2)`.
+            // Below 1/2 the offset √(1-k²) ≈ 1, so one refine would replace
+            // the parent with two tiny children at ±σ. Those parents halve
+            // on each refine until they fit. Splats within √2× of the cap
+            // stay on the ordinary split (`k` was already ≥ 1/2).
             let k_per_axis: Tensor<2> = if self.config.split_at_screen_size > 0.0 {
                 let k_max = screen_sizes
                     .select(0, refine_inds.clone())
@@ -735,7 +748,7 @@ impl SplatTrainer {
                     .clamp_min(1e-6)
                     .recip()
                     .mul_scalar(self.config.split_at_screen_size)
-                    .clamp_max(FRAC_1_SQRT_2);
+                    .clamp(MIN_SPLIT_K, FRAC_1_SQRT_2);
                 -(ratio * (-k_max + 1.0)) + 1.0
             } else {
                 -(ratio * (1.0_f32 - FRAC_1_SQRT_2)) + 1.0
