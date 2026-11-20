@@ -48,6 +48,7 @@ impl SplatOps for CubeBackend {
         _refine_weight: FloatTensor<Self>,
         _coeffs_grad_sq: FloatTensor<Self>,
         render_mode: SplatRenderMode,
+        raster_mode: crate::gaussian_splats::RasterizationMode,
         background: Vec3,
         pass: RasterPass,
     ) -> RenderOutput<Self> {
@@ -57,6 +58,9 @@ impl SplatOps for CubeBackend {
         );
         let bwd_info = pass.bwd_info();
         let smooth_cutoff = pass.smooth_cutoff();
+        // Packed forward output has no room for a depth channel. Depth is
+        // only written on the float / backward-bookkeeping path.
+        let render_depth = raster_mode.render_depth() && bwd_info;
 
         let transforms = into_contiguous(transforms);
         let sh_coeffs = into_contiguous(sh_coeffs);
@@ -277,7 +281,11 @@ impl SplatOps for CubeBackend {
                 tile_offsets.clone().into_tensor_arg(),
             );
         });
-        let out_dim = if bwd_info { 4 } else { 1 };
+        let out_dim = if bwd_info {
+            if render_depth { 5 } else { 4 }
+        } else {
+            1
+        };
         let out_img = create_tensor(
             [img_size.y as usize, img_size.x as usize, out_dim],
             &device,
@@ -329,6 +337,7 @@ impl SplatOps for CubeBackend {
                 project_uniforms.tile_bounds[0],
                 bwd_info,
                 smooth_cutoff,
+                render_depth,
             );
         });
         RenderOutput {

@@ -17,8 +17,8 @@ use burn::cubecl::cube;
 use burn::cubecl::prelude::*;
 
 use crate::kernels::helpers::{
-    ALPHA_CUTOFF_MID, TILE_SIZE, TILE_WIDTH, alpha_cutoff_weight, alpha_cutoff_weight_deriv,
-    read_projected_splat,
+    ALPHA_CUTOFF_MID, RASTER_GRAD_LANES, TILE_SIZE, TILE_WIDTH, alpha_cutoff_weight,
+    alpha_cutoff_weight_deriv, read_projected_splat,
 };
 use crate::kernels::types::{RasterizeUniforms, Splat, Sym2};
 
@@ -39,6 +39,7 @@ pub struct SplatGrad {
     pub rgb_b: f32,
     pub alpha: f32,
     pub refine: f32,
+    pub depth: f32,
 }
 
 #[cube]
@@ -54,6 +55,7 @@ fn zero_grad() -> SplatGrad {
         rgb_b: 0.0f32,
         alpha: 0.0f32,
         refine: 0.0f32,
+        depth: 0.0f32,
     }
 }
 
@@ -107,6 +109,7 @@ pub fn rasterize_backwards_kernel<A: AtomicAddF32>(
     v_splats: &mut Tensor<Atomic<A::Storage>>,
     u: RasterizeUniforms,
     #[comptime] smooth_cutoff: bool,
+    #[comptime] render_depth: bool,
 ) {
     let (tile_id, tile_origin_x, tile_origin_y) = tile_origin(u.tile_bw);
     // Only `pix_state` lives in shared memory — it gets read-modify-
@@ -114,9 +117,17 @@ pub fn rasterize_backwards_kernel<A: AtomicAddF32>(
     // other's writes. The other per-pixel inputs (`v_output`, the alpha
     // pre-roll) are read-only post-init and L1-cached, so we re-derive
     // them inline in the inner loop. Smaller shared footprint → more
-    // workgroup occupancy on Apple.
-    let mut pix_state = Shared::new_slice((TILE_SIZE * 4u32) as usize);
-    load_pixel_state(output, u, tile_origin_x, tile_origin_y, &mut pix_state);
+    // workgroup occupancy on Apple. Colour renders keep the 4-lane state.
+    let pix_stride = comptime![if render_depth { 5u32 } else { 4u32 }];
+    let mut pix_state = Shared::new_slice((TILE_SIZE * pix_stride) as usize);
+    load_pixel_state(
+        output,
+        u,
+        tile_origin_x,
+        tile_origin_y,
+        &mut pix_state,
+        render_depth,
+    );
     let (range_lo, range_hi) = load_range(tile_offsets, tile_id);
     let num_splats_in_tile = range_hi - range_lo;
     let rounds = (num_splats_in_tile + SPLAT_BATCH - 1u32) / SPLAT_BATCH;
@@ -142,9 +153,10 @@ pub fn rasterize_backwards_kernel<A: AtomicAddF32>(
             v_output,
             u,
             smooth_cutoff,
+            render_depth,
         );
         if splat_active {
-            let base = (compact_gid * 10u32) as usize;
+            let base = (compact_gid * RASTER_GRAD_LANES) as usize;
             A::add(&v_splats[base], grad.xy_x);
             A::add(&v_splats[base + 1], grad.xy_y);
             A::add(&v_splats[base + 2], grad.conic_x);
@@ -155,6 +167,9 @@ pub fn rasterize_backwards_kernel<A: AtomicAddF32>(
             A::add(&v_splats[base + 7], grad.rgb_b);
             A::add(&v_splats[base + 8], grad.alpha);
             A::add(&v_splats[base + 9], grad.refine);
+            if comptime![render_depth] {
+                A::add(&v_splats[base + 10], grad.depth);
+            }
         }
         batch_idx += 1u32;
     }
@@ -194,7 +209,11 @@ fn load_pixel_state(
     tile_origin_x: u32,
     tile_origin_y: u32,
     pix_state: &mut Shared<[f32]>,
+    #[comptime] render_depth: bool,
 ) {
+    // Channels in the rendered image. The depth numerator, when present,
+    // sits at offset 4 and has no background term.
+    let out_chans = comptime![if render_depth { 5u32 } else { 4u32 }];
     let pixels_per_load = (TILE_SIZE + SPLAT_BATCH - 1u32) / SPLAT_BATCH;
     let mut p = 0u32;
     while p < pixels_per_load {
@@ -203,10 +222,10 @@ fn load_pixel_state(
             let pix_x = tile_origin_x + pix_rank % TILE_WIDTH;
             let pix_y = tile_origin_y + pix_rank / TILE_WIDTH;
             let inside = pix_x < u.img_w && pix_y < u.img_h;
-            let s = (pix_rank * 4u32) as usize;
+            let s = (pix_rank * out_chans) as usize;
             if inside {
                 let pix_id = pix_x + pix_y * u.img_w;
-                let base = (pix_id * 4u32) as usize;
+                let base = (pix_id * out_chans) as usize;
                 let final_r = output[base];
                 let final_g = output[base + 1];
                 let final_b = output[base + 2];
@@ -216,11 +235,17 @@ fn load_pixel_state(
                 pix_state[s + 1] = final_g - t_final * u.bg_g;
                 pix_state[s + 2] = final_b - t_final * u.bg_b;
                 pix_state[s + 3] = 1.0f32;
+                if comptime![render_depth] {
+                    pix_state[s + 4] = output[base + 4];
+                }
             } else {
                 pix_state[s] = 0.0f32;
                 pix_state[s + 1] = 0.0f32;
                 pix_state[s + 2] = 0.0f32;
                 pix_state[s + 3] = 0.0f32;
+                if comptime![render_depth] {
+                    pix_state[s + 4] = 0.0f32;
+                }
             }
         }
         p += 1u32;
@@ -261,7 +286,9 @@ fn accumulate_grads_for_batch(
     v_output: &Tensor<f32>,
     u: RasterizeUniforms,
     #[comptime] smooth_cutoff: bool,
+    #[comptime] render_depth: bool,
 ) -> SplatGrad {
+    let out_chans = comptime![if render_depth { 5u32 } else { 4u32 }];
     let conic = Sym2 {
         c00: splat.conic_x,
         c01: splat.conic_y,
@@ -282,7 +309,7 @@ fn accumulate_grads_for_batch(
 
         if active_iter {
             let pixel_rank = i - UNIT_POS;
-            let s = (pixel_rank * 4u32) as usize;
+            let s = (pixel_rank * out_chans) as usize;
             let state_x = pix_state[s];
             let state_y = pix_state[s + 1];
             let state_z = pix_state[s + 2];
@@ -320,7 +347,7 @@ fn accumulate_grads_for_batch(
                         // loads for ~5 KiB of shared memory back, which
                         // recovers an Apple-GPU occupancy slot.
                         let pix_id = pix_x + pix_y * u.img_w;
-                        let pix_base = (pix_id * 4u32) as usize;
+                        let pix_base = (pix_id * out_chans) as usize;
                         let v_o_x = v_output[pix_base];
                         let v_o_y = v_output[pix_base + 1];
                         let v_o_z = v_output[pix_base + 2];
@@ -344,6 +371,16 @@ fn accumulate_grads_for_batch(
                         let new_remain_x = state_x - vis * clamped_r;
                         let new_remain_y = state_y - vis * clamped_g;
                         let new_remain_z = state_z - vis * clamped_b;
+                        if comptime![render_depth] {
+                            let v_o_d = v_output[pix_base + 4];
+                            // Depth supervises view-space position. The gradient
+                            // goes to the per-splat depth value and is not folded
+                            // into the alpha VJP (`dot_rgb`), so depth error cannot
+                            // be reduced by changing blending weights.
+                            grad.depth += vis * v_o_d;
+                            let state_d = pix_state[s + 4];
+                            pix_state[s + 4] = state_d - vis * splat.depth;
+                        }
                         // Chain through the cutoff. Hard step (production):
                         // w' = 0 and w == 1 in-branch, so the factor is 1.
                         let v_alpha_eff = dot_rgb + v_o_w * ra;

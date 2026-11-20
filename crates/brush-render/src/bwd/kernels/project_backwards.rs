@@ -3,7 +3,8 @@
 use crate::kernels::camera_model::CameraModel;
 use crate::kernels::camera_model::{calculate_project_jacobian, calculate_projection_vjp};
 use crate::kernels::helpers::{
-    apply_scale_floor, calc_cov2d, compensate_cov2d, read_quat_unorm, read_scale, world_to_cam,
+    RASTER_GRAD_LANES, apply_scale_floor, calc_cov2d, compensate_cov2d, read_quat_unorm,
+    read_scale, world_to_cam,
 };
 use crate::kernels::sh::{num_sh_coeffs, sh_coeffs_to_color_vjp, sh_color_viewdir_vjp};
 use crate::kernels::types::{Mat3, ProjectUniforms, Quat, Sym2, Vec3A};
@@ -160,7 +161,7 @@ pub fn project_backwards_kernel(
 
     // Read upstream rasterize grads first. rasterize_bwd only writes for
     // splats that contributed to a pixel; the rest write their zero row.
-    let rg_base = (compact_gid * 10u32) as usize;
+    let rg_base = (compact_gid * RASTER_GRAD_LANES) as usize;
     let v_mean2d_x = v_rasterize_grads[rg_base];
     let v_mean2d_y = v_rasterize_grads[rg_base + 1];
     let v_conics_x = v_rasterize_grads[rg_base + 2];
@@ -171,6 +172,7 @@ pub fn project_backwards_kernel(
     let v_color_b = v_rasterize_grads[rg_base + 7];
     let v_alpha_in = v_rasterize_grads[rg_base + 8];
     let v_refine_in = v_rasterize_grads[rg_base + 9];
+    let v_depth_in = v_rasterize_grads[rg_base + 10];
 
     let any_grad = v_mean2d_x != 0.0f32
         || v_mean2d_y != 0.0f32
@@ -181,7 +183,8 @@ pub fn project_backwards_kernel(
         || v_color_g != 0.0f32
         || v_color_b != 0.0f32
         || v_alpha_in != 0.0f32
-        || v_refine_in != 0.0f32;
+        || v_refine_in != 0.0f32
+        || v_depth_in != 0.0f32;
 
     if !any_grad {
         write_zero_row(
@@ -271,6 +274,9 @@ pub fn project_backwards_kernel(
         Vec2::new(v_mean2d_x, v_mean2d_y),
         camera_model,
     );
+    // Depth is view-space z, independent of the 2D projection. Adding it
+    // here moves the gaussian and does not touch opacity.
+    let v_mean_c = Vec3A::new(v_mean_c.x(), v_mean_c.y(), v_mean_c.z() + v_depth_in);
 
     // v_covar_c = J^T * v_cov2d * J (2x2 sym → 3x3 sym).
     let vcc = cam_jac.transpose_congruence_sym2(v_cov2d);

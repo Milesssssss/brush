@@ -267,6 +267,7 @@ async fn read_transforms_file(
             image,
             camera,
             image_size,
+            depth: None,
         };
         results.push(view);
     }
@@ -451,6 +452,7 @@ mod tests {
             alpha_mode: None,
             invert_masks: false,
             units_per_meter: 1.0,
+            estimate_metric_scale: false,
             max_scene_batch_cache_size: 0,
         };
         let result = read_dataset(vfs, &config)

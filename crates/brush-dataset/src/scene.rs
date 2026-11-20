@@ -4,6 +4,7 @@ use glam::{Affine3A, Vec3, vec3};
 use image::DynamicImage;
 use std::sync::Arc;
 
+pub use crate::load_depth::LoadDepth;
 pub use crate::load_image::LoadImage;
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -18,6 +19,8 @@ pub struct SceneView {
     pub image: LoadImage,
     pub camera: Camera,
     pub image_size: glam::UVec2,
+    /// Optional float32 depth map matched to this view. `0` marks invalid depth.
+    pub depth: Option<LoadDepth>,
 }
 
 // Encapsulates a multi-view scene including cameras and the splats.
@@ -66,6 +69,7 @@ impl Scene {
                 image: v.image.with_scale(scale),
                 camera: v.camera,
                 image_size: v.image_size,
+                depth: v.depth,
             })
             .collect();
         Self::new(views)
@@ -145,6 +149,8 @@ pub struct SceneBatch {
     /// should consume (mask weight, alpha-matching loss, bg compositing).
     pub has_alpha: bool,
     pub alpha_mode: AlphaMode,
+    /// Optional `[H, W]` f32 depth, `0` marking invalid samples.
+    pub depth: Option<TensorData>,
     pub camera: Camera,
 }
 
@@ -156,6 +162,13 @@ impl SceneBatch {
             .len()
             .try_into()
             .expect("shouldn't exceed ~18 Exabytes...")
+    }
+
+    /// Image bytes plus the optional depth map. The frame cache uses this so
+    /// depth maps count against the same budget as the packed images.
+    pub fn resident_bytes(&self) -> u64 {
+        let depth = self.depth.as_ref().map_or(0, |d| d.as_bytes().len() as u64);
+        self.packed_bytes().saturating_add(depth)
     }
 
     pub fn img_size(&self) -> [usize; 2] {

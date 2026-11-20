@@ -48,9 +48,15 @@ pub struct LoadDatasetConfig {
     pub invert_masks: bool,
     /// Dataset units per metre. Camera positions and initial splats are divided
     /// by this on load so training runs in metres, and exports multiply back.
-    /// E.g. 1000 for a scene reconstructed in millimetres.
+    /// E.g. 1000 for a scene reconstructed in millimetres. Applied after
+    /// `--estimate-metric-scale` when that flag recovers a scale.
     #[arg(long, help_heading = "Dataset Options", default_value = "1.0")]
     pub units_per_meter: f32,
+    /// Recover one global scale from COLMAP landmarks and per-image depth maps
+    /// so the reconstruction matches the depth maps' units. Off by default,
+    /// and skipped when no `depth` folder is present.
+    #[arg(long, help_heading = "Dataset Options", default_value_t = false)]
+    pub estimate_metric_scale: bool,
     /// Max size of the cache for frames of the dataset, larger values usually improve performance for large datasets at the cost of more memory usage, can be e.g. 6G, 6000M, 6000MiB, 6000MB
     #[arg(long, help_heading = "Dataset Options", default_value = DEFAULT_MAX_SCENE_BATCH_CACHE_SIZE, value_parser = parse_size)]
     pub max_scene_batch_cache_size: u64,

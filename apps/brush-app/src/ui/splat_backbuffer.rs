@@ -1,6 +1,9 @@
 use brush_async::{Actor, AsyncMap};
+use brush_dataset::depth::colorize_depth;
 use brush_process::slot::Slot;
-use brush_render::{TextureMode, camera::Camera, gaussian_splats::Splats, render_splats};
+use brush_render::{
+    TextureMode, camera::Camera, gaussian_splats::Splats, render_splats, render_splats_depth,
+};
 use egui::Rect;
 use glam::{UVec2, Vec3};
 use std::sync::{Arc, Weak};
@@ -20,6 +23,7 @@ struct LastRenderState {
     camera: Camera,
     background: Vec3,
     splat_scale: Option<f32>,
+    depth_view: bool,
     img_size: UVec2,
 }
 
@@ -29,6 +33,8 @@ struct Frame {
     width: u32,
     height: u32,
     pixels: Arc<Vec<u8>>,
+    /// Min and max of the positive depths in this frame, when it is a depth view.
+    depth_range: Option<(f32, f32)>,
 }
 
 pub struct SplatBackbuffer {
@@ -52,30 +58,11 @@ impl SplatBackbuffer {
         let pipe = AsyncMap::new(
             actor,
             async move |req: &RenderRequest| {
-                let (image, _) = render_splats(
-                    req.splats.get(req.state.frame).unwrap(),
-                    &req.state.camera,
-                    req.state.img_size,
-                    req.state.background,
-                    req.state.splat_scale,
-                    TextureMode::Packed,
-                )
-                .await;
-
-                let shape = image.shape();
-                let (height, width) = (shape[0] as u32, shape[1] as u32);
-
-                let data = image
-                    .into_data_async()
-                    .await
-                    .expect("Failed to read back frame");
-                // Materialize lazy readback here and release its GPU allocation.
-                let pixels = data.into_bytes().to_vec();
-
-                Frame {
-                    width,
-                    height,
-                    pixels: Arc::new(pixels),
+                let splats = req.splats.get(req.state.frame).unwrap();
+                if req.state.depth_view {
+                    render_depth_frame(splats, req).await
+                } else {
+                    render_color_frame(splats, req).await
                 }
             },
             |req: &RenderRequest| req.ctx.request_repaint(),
@@ -93,8 +80,9 @@ impl SplatBackbuffer {
         frame: usize,
         background: Vec3,
         splat_scale: Option<f32>,
+        depth_view: bool,
         splats_dirty: bool,
-    ) {
+    ) -> Option<(f32, f32)> {
         // Calculate pixel size for rendering
         let ppp = ui.ctx().pixels_per_point();
         let img_size = UVec2::new(
@@ -108,6 +96,7 @@ impl SplatBackbuffer {
             camera: *camera,
             background,
             splat_scale,
+            depth_view,
             img_size,
         };
 
@@ -123,12 +112,84 @@ impl SplatBackbuffer {
         }
 
         if let Some(frame) = self.pipe.latest() {
+            let depth_range = frame.depth_range;
             ui.painter()
                 .add(eframe::egui_wgpu::Callback::new_paint_callback(
                     rect,
                     SplatBackbufferPainter { frame },
                 ));
+            depth_range
+        } else {
+            None
         }
+    }
+}
+
+async fn render_color_frame(splats: Splats, req: &RenderRequest) -> Frame {
+    let (image, _) = render_splats(
+        splats,
+        &req.state.camera,
+        req.state.img_size,
+        req.state.background,
+        req.state.splat_scale,
+        TextureMode::Packed,
+    )
+    .await;
+
+    let shape = image.shape();
+    let (height, width) = (shape[0] as u32, shape[1] as u32);
+    let data = image
+        .into_data_async()
+        .await
+        .expect("Failed to read back frame");
+    Frame {
+        width,
+        height,
+        pixels: Arc::new(data.into_bytes().to_vec()),
+        depth_range: None,
+    }
+}
+
+async fn render_depth_frame(splats: Splats, req: &RenderRequest) -> Frame {
+    let (image, _) = render_splats_depth(
+        splats,
+        &req.state.camera,
+        req.state.img_size,
+        req.state.background,
+        req.state.splat_scale,
+    )
+    .await;
+    let data = image
+        .into_data_async()
+        .await
+        .expect("Failed to read back depth");
+    let values = data.try_to_vec::<f32>().expect("depth image must be f32");
+    let width = req.state.img_size.x as usize;
+    let height = req.state.img_size.y as usize;
+    let mut depth = vec![0.0f32; width * height];
+    for (i, pixel) in depth.iter_mut().enumerate() {
+        let base = i * 5;
+        let alpha = values[base + 3];
+        let accumulated = values[base + 4];
+        *pixel = if alpha > 1e-6 {
+            accumulated / alpha
+        } else {
+            0.0
+        };
+    }
+    let colored = colorize_depth(&depth, width, height);
+    let depth_range = colored
+        .rgba
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .any(|px| px[3] > 0)
+        .then_some((colored.min, colored.max));
+    Frame {
+        width: width as u32,
+        height: height as u32,
+        pixels: Arc::new(colored.rgba),
+        depth_range,
     }
 }
 
@@ -360,6 +421,7 @@ mod tests {
             width: 1,
             height: 1,
             pixels: Arc::new(vec![0, 0, 0, 255]),
+            depth_range: None,
         };
         let mut painter = SplatBackbufferPainter { frame };
         let prepare = |painter: &SplatBackbufferPainter,

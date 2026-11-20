@@ -99,9 +99,20 @@ Fewer views and fewer SfM points mean less work per step and a smaller starting 
 - Use `--subsample-frames 2` or `4` to scout settings
 - `--subsample-points` helps when the init PLY is huge (also see `--max-splats` subsampling at load)
 
+## Depth supervision
+
+Off unless you opt in. Existing runs are unchanged.
+
+| Flag | Default | What it does |
+| --- | --- | --- |
+| `--depth-loss-weight` | `0` | Inverse-depth L1 against COLMAP `depth/*.tiff` maps. `0` disables the loss and the extra render channel. |
+| `--estimate-metric-scale` | off | One global scale from those depth maps and projected landmarks. Skipped when no depth maps are present. `--units-per-meter` still applies afterwards. |
+
+Depth maps are single-channel float32 TIFFs. `0` means invalid. Match the RGB stem: `images/frame.png` → `depth/frame.tiff`.
+
 ## Learning rates and loss (usually leave alone)
 
-`--lr-mean`, `--lr-mean-end`, `--lr-coeffs-dc`, `--lr-opac`, `--lr-scale`, `--lr-rotation`, `--ssim-weight`, and related flags match common Gaussian-splatting defaults.
+`--lr-mean`, `--lr-mean-end`, `--lr-coeffs-dc`, `--lr-opac`, `--lr-scale`, `--lr-rotation`, `--ssim-weight`, and related flags match common Gaussian-splatting defaults. `--depth-loss-weight` stays `0` unless the scene has depth maps you want to supervise with.
 
 Touch these only when diagnosing divergence or known scene quirks. Prefer resolution, growth, and iteration budget for normal tuning.
 

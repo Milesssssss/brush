@@ -31,6 +31,16 @@ It also supports masking images:
 
 For practical guidance on CLI training flags (how to trade off run length, splat count, and VRAM), see [docs/training-parameters.md](docs/training-parameters.md).
 
+### Depth supervision
+
+COLMAP datasets can include a `depth` folder of single-channel float32 TIFF depth maps, matched to the RGB images by file stem (`images/frame.png` pairs with `depth/frame.tiff`, or with the same relative subdirectory). A value of `0` marks an invalid pixel. Other dataset formats ignore these files.
+
+`--depth-loss-weight` (default `0`) adds an L1 loss on inverse depth, `mean(|1/rendered − 1/ground truth|)`, over the valid pixels. Leaving it at `0` keeps the existing training loss and the 4-channel render. The rendered depth is the alpha-weighted sum divided by accumulated alpha, and that alpha is detached so the loss moves gaussians instead of changing opacity.
+
+COLMAP reconstructions have an arbitrary scale. `--estimate-metric-scale` (default off) estimates one global scale from the depth maps and the projected landmarks, then applies it to the camera positions and the initial point cloud. It does nothing when the flag is off or when no depth maps are present. `--units-per-meter` is applied after that scale.
+
+In the viewer, **Depth map** shows the rendered expected depth with a turbo colormap. In the dataset panel, **Depth** shows the loaded ground-truth map for the current view, with the same colormap.
+
 ### Checkpoints
 
 Training can be stopped and later continued without quality loss. Pass `--checkpoint-every 1000` to write a full checkpoint
