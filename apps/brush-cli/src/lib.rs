@@ -177,7 +177,7 @@ pub async fn run_render_animation(args: &Cli) -> Result<(), anyhow::Error> {
         vec![(source_path.clone(), args.animation.anim_out.clone())]
     };
 
-    let device: burn::tensor::Device = brush_process::burn_init_setup().await.into();
+    let device = brush_process::burn_init_setup().await;
 
     // Pin the render loop to a single thread. Brush's GPU layer keys ordering
     // on `StreamId::current()` (thread-local), and each frame issues GPU work

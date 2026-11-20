@@ -30,6 +30,9 @@ ignore = [
     "RUSTSEC-2024-0436",
     # ttf-parser is unmaintained, used transitively by winit.
     "RUSTSEC-2026-0192",
+    # humantime wraps chrono, which is unmaintained. No upgrade exists.
+    # Direct dependency of brush-app and brush-cli, already on main.
+    "RUSTSEC-2026-0542",
     # C SQLite CVE-2026-119375 (local attack vector, crafted db + wal file
     # pair). The fix is libsqlite3-sys 0.39, a semver-major bump that has to
     # come through rusqlite and cubecl, wait for them to upgrade.
