@@ -225,7 +225,7 @@ impl AnimationPanel {
     #[cfg(not(target_family = "wasm"))]
     fn apply_config_to_viewer(&self, process: &UiProcess) {
         process.set_model_local_to_world(self.config.model_local_to_world);
-        process.set_cam_fov(self.config.fov_y);
+        process.set_cam_intrinsics(self.config.fov_x, self.config.fov_y, self.config.center_uv);
         let mut settings = process.get_cam_settings();
         settings.background = Some(self.config.background);
         settings.splat_scale = self.config.splat_scale;
