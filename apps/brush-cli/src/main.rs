@@ -25,11 +25,6 @@ fn main() -> anyhow::Result<()> {
         );
     }
 
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .expect("Failed to initialize tokio runtime");
-
     // `validate` guarantees a source is present when the viewer is off.
     let process = build_process(&args).expect("source must be present");
 
