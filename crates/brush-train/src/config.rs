@@ -89,6 +89,18 @@ pub struct TrainConfig {
     #[arg(long, help_heading = "Training options", default_value = "0.004")]
     pub opac_decay: f32,
 
+    /// Periodically clamp opacity and zero its Adam moments. `0` (the default)
+    /// disables the reset and leaves [`TrainConfig::opac_decay`] running, so
+    /// existing runs stay unchanged.
+    ///
+    /// When set to `N > 0`, every `N` phase iterations — not at iteration 0,
+    /// and not after 95% of the phase, the same cutoff as refine —
+    /// `sigmoid(opacity)` is clamped to at most `0.01` and the Adam moments
+    /// for opacity are zeroed. The step counter is kept. While the reset is
+    /// enabled, [`TrainConfig::opac_decay`] is skipped so the two do not stack.
+    #[arg(long, help_heading = "Training options", default_value = "0")]
+    pub opacity_reset_every: u32,
+
     /// Mip-Splatting 3D-filter strength (the paper's `s`): each splat gets a
     /// per-splat world-space scale floor `sqrt(min_scale_factor) · pixel size
     /// at the nearest observing camera`, i.e. a ~0.32px std-dev floor at the
@@ -152,5 +164,24 @@ impl Default for TrainConfig {
 impl TrainConfig {
     pub fn total_iters(&self) -> u32 {
         self.total_train_iters + self.lod_levels * self.lod_refine_steps
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn opacity_reset_every_defaults_off_and_parses() {
+        let config = TrainConfig::default();
+        assert_eq!(config.opacity_reset_every, 0);
+        assert!((config.opac_decay - 0.004).abs() < 1e-6);
+
+        let enabled = TrainConfig::try_parse_from(["brush", "--opacity-reset-every", "3000"])
+            .expect("flag parses");
+        assert_eq!(enabled.opacity_reset_every, 3000);
+        assert!((enabled.opac_decay - config.opac_decay).abs() < 1e-6);
+        assert_eq!(enabled.refine_every, config.refine_every);
+        assert_eq!(enabled.total_train_iters, config.total_train_iters);
     }
 }
