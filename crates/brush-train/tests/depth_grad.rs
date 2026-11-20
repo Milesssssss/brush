@@ -1,8 +1,11 @@
-//! A depth-only loss must move gaussian positions and leave opacity alone.
+//! A depth-only loss must move gaussian positions and leave blending weights alone.
 //!
-//! Two routes otherwise carry depth error into opacity: a differentiable
-//! `accumulated / alpha` denominator, and the rasterizer folding the depth
-//! channel into the blending-weight derivative. Both are closed.
+//! Two routes otherwise carry depth error into opacity. The quotient
+//! `accumulated / alpha` is differentiable in alpha, and the depth loss detaches
+//! that denominator. The rasterizer would also add the depth channel into the
+//! alpha dot-accumulator, which changes opacity and the gaussian footprint.
+//! That term is omitted. With both routes closed, depth supervision moves
+//! positions and does not change opacity, rotation, or scale.
 
 use brush_loss::{expected_depth, inverse_depth_l1};
 use brush_render::bwd::render_splats_with_mode;
@@ -68,10 +71,12 @@ async fn depth_loss_moves_positions_not_opacity() {
     let gt = Tensor::<2>::ones([img_h, img_w], &device) * 3.0;
     let grads = splats.bwd_validate(inverse_depth_l1(rendered, gt)).await;
 
-    let means_grad = splats
+    let transforms_grad = splats
         .transforms
         .grad(&grads)
-        .expect("depth loss must reach gaussian positions")
+        .expect("depth loss must reach gaussian positions");
+    let means_grad = transforms_grad
+        .clone()
         .slice(s![.., 0..3])
         .abs()
         .max()
@@ -83,6 +88,20 @@ async fn depth_loss_moves_positions_not_opacity() {
         "expected a nonzero position gradient, got {means_grad}"
     );
 
+    // Rotation and scale set the blending footprint. Depth must not use them
+    // to reduce the loss.
+    let pose_grad = transforms_grad
+        .slice(s![.., 3..10])
+        .abs()
+        .max()
+        .into_scalar_async::<f32>()
+        .await
+        .expect("rotation and scale grad");
+    assert!(
+        pose_grad < 1e-6,
+        "depth loss leaked into rotation or scale: {pose_grad}"
+    );
+
     if let Some(opac_grad) = splats.raw_opacities.grad(&grads) {
         let opac_grad = opac_grad
             .abs()
@@ -91,7 +110,7 @@ async fn depth_loss_moves_positions_not_opacity() {
             .await
             .expect("opacity grad");
         assert!(
-            opac_grad < 1e-6,
+            opac_grad < 1e-8,
             "depth loss leaked into opacity: {opac_grad}"
         );
     }

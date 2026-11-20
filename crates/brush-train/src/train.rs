@@ -386,8 +386,9 @@ impl SplatTrainer {
             if use_depth && let Some(depth_data) = batch.depth.clone() {
                 let gt_depth = Tensor::<2>::from_data(depth_data, &device);
                 let accumulated = pred_image.clone().slice(s![.., .., 4..5]);
-                // Detach alpha. A differentiable denominator lets depth error
-                // shrink the loss by changing opacity instead of position.
+                // Detach alpha in the quotient. The rasterizer also leaves the
+                // depth channel out of the alpha dot-accumulator, so depth
+                // error cannot be reduced by changing opacity.
                 let alpha = pred_image.clone().slice(s![.., .., 3..4]);
                 let rendered = expected_depth(accumulated, alpha).reshape([img_h, img_w]);
                 loss = loss + inverse_depth_l1(rendered, gt_depth) * self.config.depth_loss_weight;

@@ -373,12 +373,17 @@ fn accumulate_grads_for_batch(
                         let new_remain_z = state_z - vis * clamped_b;
                         if comptime![render_depth] {
                             let v_o_d = v_output[pix_base + 4];
-                            // Depth supervises view-space position. The gradient
-                            // goes to the per-splat depth value and is not folded
-                            // into the alpha VJP (`dot_rgb`), so depth error cannot
-                            // be reduced by changing blending weights.
-                            grad.depth += vis * v_o_d;
                             let state_d = pix_state[s + 4];
+                            // Depth supervises view-space position only. The
+                            // gradient goes to the per-splat depth value. The
+                            // alpha contribution
+                            //   (state_w * splat.depth - state_d) * v_o_d * ra
+                            // is left out of `dot_rgb` on purpose: that term is
+                            // how the depth channel would otherwise change
+                            // blending weights (opacity and footprint) instead
+                            // of moving the gaussian. The loss also detaches
+                            // alpha in the accumulated-depth / alpha quotient.
+                            grad.depth += vis * v_o_d;
                             pix_state[s + 4] = state_d - vis * splat.depth;
                         }
                         // Chain through the cutoff. Hard step (production):
