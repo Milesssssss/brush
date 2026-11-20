@@ -165,6 +165,19 @@ impl UiProcess {
         self.read().repaint();
     }
 
+    /// Replace both FOV axes and the principal point. Unlike [`Self::set_cam_fov`],
+    /// this does not derive `fov_x` from the current aspect ratio.
+    #[cfg(not(target_family = "wasm"))]
+    pub fn set_cam_intrinsics(&self, fov_x: f64, fov_y: f64, center_uv: glam::Vec2) {
+        {
+            let mut inner = self.write();
+            inner.camera.fov_x = fov_x;
+            inner.camera.fov_y = fov_y;
+            inner.camera.center_uv = center_uv;
+        }
+        self.read().repaint();
+    }
+
     pub fn focus_view(&self, cam: &Camera) {
         // Also focus this view.
         let mut inner = self.write();
@@ -203,6 +216,14 @@ impl UiProcess {
         if scene_scale.is_finite() && scene_scale > 0.0 {
             self.write().controls.scene_scale = scene_scale;
         }
+    }
+
+    /// Only the native animation panel drives this (on config load).
+    #[cfg(not(target_family = "wasm"))]
+    pub fn set_model_local_to_world(&self, transform: Affine3A) {
+        let mut inner = self.write();
+        inner.controls.model_local_to_world = transform;
+        inner.repaint();
     }
 
     /// Connect to an existing running process.

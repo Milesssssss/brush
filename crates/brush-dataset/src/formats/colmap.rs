@@ -217,8 +217,18 @@ async fn load_dataset_inner(
                 load_args.alpha_mode,
                 load_args.invert_masks,
             );
+            // Camera metadata is the reconstruction resolution. A resized image
+            // file keeps those numbers, and the Mip-Splatting scale floor uses
+            // this size as the native pixel focal length. Read the file header
+            // (not a full decode) so the cached size matches the pixels.
+            let (w, h) = image.dimensions().await?;
+            let image_size = glam::uvec2(w, h);
 
-            views.push(SceneView { camera, image });
+            views.push(SceneView {
+                camera,
+                image,
+                image_size,
+            });
         }
 
         let (train_views, eval_views) = split_eval_every(views, load_args.eval_split_every);
@@ -499,6 +509,13 @@ mod tests {
         let views = &result.dataset.train.views;
         assert_eq!(views.len(), 3);
         assert!(result.dataset.eval.is_none());
+        // File headers are 4x3; cameras.txt still says 64x48. The cached size
+        // follows the file, which is what the scale floor's pixel focal uses.
+        assert!(
+            views
+                .iter()
+                .all(|view| view.image_size == glam::uvec2(4, 3))
+        );
         assert_eq!(result.warnings.len(), 1);
         assert!(result.warnings[0].contains("missing.png"));
 
