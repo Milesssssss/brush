@@ -10,9 +10,9 @@ use crate::{
     stats::RefineRecord,
 };
 use brush_dataset::scene::SceneBatch;
-use brush_loss::{ImageLossConfig, image_loss};
-use brush_render::bwd::render_splats;
-use brush_render::gaussian_splats::Splats;
+use brush_loss::{ImageLossConfig, expected_depth, image_loss, inverse_depth_l1};
+use brush_render::bwd::render_splats_with_mode;
+use brush_render::gaussian_splats::{RasterPass, RasterizationMode, Splats};
 use brush_render::{AlphaMode, bounding_box::BoundingBox, sh::sh_coeffs_for_degree};
 use burn::{
     module::Param,
@@ -304,9 +304,24 @@ impl SplatTrainer {
             // The splats already carry their 3D-filter floor (set at refine);
             // the render path folds it in. Optimizer/refine work on raw params.
             let render_input = splats.clone();
-            let diff_out = render_splats(render_input, &camera, img_size, background)
-                .instrument(trace_span!("Forward"))
-                .await;
+            // Depth stays off unless this view has a map and the weight is
+            // positive, so the colour render and its gradients are unchanged.
+            let use_depth = batch.depth.is_some() && self.config.depth_loss_weight > 0.0;
+            let raster_mode = if use_depth {
+                RasterizationMode::RgbaAndDepth
+            } else {
+                RasterizationMode::Rgba
+            };
+            let diff_out = render_splats_with_mode(
+                render_input,
+                &camera,
+                img_size,
+                background,
+                RasterPass::Backward,
+                raster_mode,
+            )
+            .instrument(trace_span!("Forward"))
+            .await;
 
             let pred_image = diff_out.img;
             let refine_weight_holder = diff_out.refine_weight_holder;
@@ -345,8 +360,15 @@ impl SplatTrainer {
             // The kernel takes the RGBA image as rendered.
             // `loss` is only reassigned by the LPIPS path below, which is
             // compiled out on wasm — so `mut` is unused there.
+            // Depth renders append a 5th channel. The image loss still sees
+            // the original RGBA image, and only when depth is enabled.
+            let pred_for_loss = if use_depth {
+                pred_image.clone().slice(s![.., .., 0..4])
+            } else {
+                pred_image.clone()
+            };
             #[cfg_attr(target_family = "wasm", allow(unused_mut))]
-            let mut loss = image_loss(pred_image.clone(), gt_packed.clone(), cfg);
+            let mut loss = image_loss(pred_for_loss, gt_packed.clone(), cfg);
 
             // LPIPS still needs an f32 RGB tensor for VGG. Materialising it
             // here costs ~99 MB at 4K, only when LPIPS is enabled.
@@ -359,6 +381,30 @@ impl SplatTrainer {
                         pred_image.clone().slice(s![.., .., 0..3]).unsqueeze_dim(0),
                         gt_rgb_diff.unsqueeze_dim(0),
                     ) * self.config.lpips_loss_weight;
+            }
+
+            if use_depth && let Some(depth_data) = batch.depth.clone() {
+                let gt_depth = Tensor::<2>::from_data(depth_data, &device);
+                let accumulated = pred_image.clone().slice(s![.., .., 4..5]);
+                // Detach alpha in the quotient. The rasterizer also leaves the
+                // depth channel out of the alpha dot-accumulator, so depth
+                // error cannot be reduced by changing opacity.
+                let alpha = pred_image.clone().slice(s![.., .., 3..4]);
+                let rendered = expected_depth(accumulated, alpha).reshape([img_h, img_w]);
+                // Masked views already ignore RGB outside the silhouette. Depth
+                // uses the same alpha byte as a per-pixel weight.
+                let depth_mask = masked_alpha.then(|| {
+                    let alpha_byte = gt_packed
+                        .clone()
+                        .bitwise_right_shift_scalar(24)
+                        .bitwise_and_scalar(0xFF)
+                        .float()
+                        .div_scalar(255.0);
+                    Tensor::from_inner(alpha_byte)
+                });
+                loss = loss
+                    + inverse_depth_l1(rendered, gt_depth, depth_mask)
+                        * self.config.depth_loss_weight;
             }
 
             // Strip the autodiff graph off the loss so consumers can read the

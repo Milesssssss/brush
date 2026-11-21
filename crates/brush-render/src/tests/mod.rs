@@ -115,7 +115,7 @@ async fn renders_many_splats() {
         "30M splats in front of camera, none survived projection"
     );
     let pixels = read_finite(output).await;
-    let any_nonbg = pixels.chunks_exact(4).any(|c| c[3] > 1e-3);
+    let any_nonbg = pixels.as_chunks::<4>().0.iter().any(|c| c[3] > 1e-3);
     assert!(any_nonbg, "30M splats rendered to an entirely empty image");
 }
 
@@ -760,7 +760,7 @@ async fn packed_readback_is_rgba8() {
 
     // The kernel truncates rather than rounds, so allow the odd 1-LSB slip.
     let expect = [bg.x, bg.y, bg.z, 0.0].map(|c| (c * 255.0) as u8);
-    for (i, px) in bytes.chunks_exact(4).enumerate() {
+    for (i, px) in bytes.as_chunks::<4>().0.iter().enumerate() {
         assert!(
             px.iter()
                 .zip(expect)
@@ -807,7 +807,7 @@ async fn zero_splats_renders_background() {
         .expect("data vec");
     let n_pixels = (img_size.x * img_size.y) as usize;
     assert_eq!(pixels.len(), n_pixels * 4);
-    for (i, chunk) in pixels.chunks_exact(4).enumerate() {
+    for (i, chunk) in pixels.as_chunks::<4>().0.iter().enumerate() {
         let [r, g, b, a] = [chunk[0], chunk[1], chunk[2], chunk[3]];
         assert!(
             (r - bg.x).abs() < 1e-5

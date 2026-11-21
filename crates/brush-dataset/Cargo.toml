@@ -28,6 +28,7 @@ brush-async.path = "../brush-async"
 clap.workspace = true
 parse-size.workspace = true
 itertools = "0.15"
+tiff = { version = "0.11", default-features = false, features = ["deflate", "lzw"] }
 
 [target.'cfg(target_family = "wasm")'.dependencies]
 tokio = { workspace = true, features = ["io-util"] }

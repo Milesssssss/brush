@@ -1,8 +1,10 @@
 use std::collections::VecDeque;
+use std::path::PathBuf;
 
 use brush_dataset::{
     Dataset,
-    scene::{LoadImage, Scene, SceneView, ViewType},
+    depth::{colorize_depth, resample_nearest},
+    scene::{LoadDepth, LoadImage, Scene, SceneView, ViewType},
 };
 use brush_process::message::{ProcessMessage, TrainMessage};
 use brush_render::AlphaMode;
@@ -13,7 +15,9 @@ use tokio::sync::oneshot;
 use brush_async::Actor;
 
 use crate::ui::{
-    UiMode, draw_checkerboard,
+    UiMode,
+    depth_bar::draw_depth_colorbar,
+    draw_checkerboard,
     panels::AppPane,
     ui_process::{BackgroundStyle, TexHandle, UiProcess},
 };
@@ -146,6 +150,118 @@ impl PreviewLoader {
     }
 }
 
+#[derive(Clone)]
+struct DepthFrame {
+    path: PathBuf,
+    tex: TexHandle,
+    min: f32,
+    max: f32,
+}
+
+struct DepthJob {
+    depth: LoadDepth,
+    edge: u32,
+    ctx: egui::Context,
+    reply: oneshot::Sender<Option<DepthFrame>>,
+}
+
+struct DepthPreviewLoader {
+    jobs: async_channel::Sender<DepthJob>,
+    _worker: Actor,
+    pending: Option<(PathBuf, oneshot::Receiver<Option<DepthFrame>>)>,
+    ready: Option<DepthFrame>,
+}
+
+impl DepthPreviewLoader {
+    fn new() -> Self {
+        let (jobs, rx) = async_channel::unbounded::<DepthJob>();
+        let actor = Actor::new("dataset-depth");
+        actor
+            .run(move || async move {
+                while let Ok(job) = rx.recv().await {
+                    let frame = load_depth_preview(job.depth, job.ctx.clone(), job.edge).await;
+                    let _ = job.reply.send(frame);
+                    job.ctx.request_repaint();
+                }
+            })
+            .detach();
+        Self {
+            jobs,
+            _worker: actor,
+            pending: None,
+            ready: None,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.pending = None;
+        self.ready = None;
+    }
+
+    fn request(&mut self, depth: &LoadDepth, ctx: &egui::Context, edge: u32) -> Option<DepthFrame> {
+        let path = depth.path().to_path_buf();
+        if self.ready.as_ref().is_some_and(|frame| frame.path == path) {
+            return self.ready.clone();
+        }
+        let pending_matches = self
+            .pending
+            .as_ref()
+            .is_some_and(|(pending, _)| pending == &path);
+        if !pending_matches {
+            let (reply, rx) = oneshot::channel();
+            let _ = self.jobs.try_send(DepthJob {
+                depth: depth.clone(),
+                edge,
+                ctx: ctx.clone(),
+                reply,
+            });
+            self.pending = Some((path.clone(), rx));
+        }
+        if let Some((_, rx)) = &mut self.pending
+            && let Ok(frame) = rx.try_recv()
+        {
+            self.pending = None;
+            self.ready = frame;
+        }
+        self.ready.clone().filter(|frame| frame.path == path)
+    }
+}
+
+async fn load_depth_preview(depth: LoadDepth, ctx: egui::Context, edge: u32) -> Option<DepthFrame> {
+    let path = depth.path().to_path_buf();
+    let (samples, width, height) = depth.load_in_scene_units().await.ok()?;
+    let long_edge = width.max(height).max(1);
+    let (preview, preview_w, preview_h) = if long_edge > edge as usize {
+        let scale = edge as f32 / long_edge as f32;
+        let preview_w = ((width as f32 * scale).round() as usize).max(1);
+        let preview_h = ((height as f32 * scale).round() as usize).max(1);
+        (
+            resample_nearest(&samples, width, height, preview_w, preview_h),
+            preview_w,
+            preview_h,
+        )
+    } else {
+        (samples, width, height)
+    };
+    let colored = colorize_depth(&preview, preview_w, preview_h);
+    let image = egui::ColorImage::from_rgba_unmultiplied([preview_w, preview_h], &colored.rgba);
+    let handle = ctx.load_texture(
+        path.to_string_lossy().into_owned(),
+        image,
+        TextureOptions::default(),
+    );
+    Some(DepthFrame {
+        path,
+        tex: TexHandle {
+            handle,
+            has_alpha: true,
+            train_size: (width as u32, height as u32),
+        },
+        min: colored.min,
+        max: colored.max,
+    })
+}
+
 pub struct DatasetPanel {
     view_type: ViewType,
     cur_dataset: Dataset,
@@ -153,6 +269,8 @@ pub struct DatasetPanel {
     current_view_index: Option<usize>,
     loading_start: Option<web_time::Instant>,
     loader: PreviewLoader,
+    show_depth: bool,
+    depth_loader: DepthPreviewLoader,
 
     displayed: Option<(SceneView, TexHandle)>,
 }
@@ -166,6 +284,8 @@ impl Default for DatasetPanel {
             loading_start: None,
             displayed: None,
             loader: PreviewLoader::new(),
+            show_depth: false,
+            depth_loader: DepthPreviewLoader::new(),
         }
     }
 }
@@ -202,6 +322,58 @@ async fn load_preview(view: SceneView, ctx: egui::Context, preview_edge: u32) ->
 }
 
 impl DatasetPanel {
+    fn draw_loaded_depth(&mut self, ui: &mut egui::Ui, view: &SceneView) {
+        let available = ui.available_size();
+        let cursor_min = ui.cursor().min;
+        let full_rect = egui::Rect::from_min_size(cursor_min, available);
+        ui.painter()
+            .rect_filled(full_rect, 0.0, Color32::from_gray(20));
+
+        let Some(depth) = &view.depth else {
+            ui.centered_and_justified(|ui| {
+                ui.label(
+                    egui::RichText::new("This view has no depth map")
+                        .size(14.0)
+                        .color(Color32::from_rgb(140, 140, 140))
+                        .italics(),
+                );
+            });
+            return;
+        };
+
+        let edge = ((available.max_elem() * ui.ctx().pixels_per_point()).ceil() as u32).max(32);
+        let Some(frame) = self.depth_loader.request(depth, ui.ctx(), edge) else {
+            ui.centered_and_justified(|ui| {
+                ui.label(
+                    egui::RichText::new("Loading depth map")
+                        .size(14.0)
+                        .color(Color32::from_rgb(140, 140, 140))
+                        .italics(),
+                );
+            });
+            return;
+        };
+
+        let aspect = frame.tex.handle.aspect_ratio();
+        let mut size = available;
+        if size.x / size.y > aspect {
+            size.x = size.y * aspect;
+        } else {
+            size.y = size.x / aspect;
+        }
+        let min =
+            cursor_min + egui::vec2((available.x - size.x) / 2.0, (available.y - size.y) / 2.0);
+        let rect = egui::Rect::from_min_size(min, size);
+        ui.painter().image(
+            frame.tex.handle.id(),
+            rect,
+            egui::Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+            Color32::WHITE,
+        );
+        draw_depth_colorbar(ui, full_rect, frame.min, frame.max);
+        ui.allocate_rect(full_rect, egui::Sense::click());
+    }
+
     fn focus_picked(&self, process: &UiProcess) {
         let pick_scene = selected_scene(self.view_type, &self.cur_dataset);
 
@@ -270,6 +442,7 @@ impl AppPane for DatasetPanel {
                 }
                 self.cur_dataset = dataset.clone();
                 self.loader = PreviewLoader::new();
+                self.depth_loader.clear();
                 self.displayed = None;
             }
             ProcessMessage::SplatsUpdated { up_axis, .. } => {
@@ -306,6 +479,11 @@ impl AppPane for DatasetPanel {
 
         let target_view = pick_scene.views[*nearest].clone();
         self.current_view_index = Some(*nearest);
+
+        if self.show_depth {
+            self.draw_loaded_depth(ui, &target_view);
+            return;
+        }
 
         // Size previews to the panel in physical pixels, so we neither waste
         // memory on oversized textures nor visibly downscale on large/hi-DPI
@@ -417,6 +595,14 @@ impl AppPane for DatasetPanel {
         let mut current_idx = self.current_view_index.unwrap_or(0);
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui
+                .selectable_label(self.show_depth, "Depth")
+                .on_hover_text("Show the loaded depth map for this view")
+                .clicked()
+            {
+                self.show_depth = !self.show_depth;
+            }
+            ui.add_space(6.0);
             if self.cur_dataset.eval.is_some() {
                 let gear_button =
                     egui::Button::new(egui::RichText::new("⚙").size(14.0).color(Color32::WHITE))
