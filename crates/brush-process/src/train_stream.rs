@@ -412,7 +412,7 @@ pub(crate) async fn train_stream(
         if trainer.opacity_reset_due(phase_iter, phase_progress) {
             splats = trainer.reset_opacity(splats);
             log::info!(
-                "Opacity reset at phase iteration {phase_iter}: clamped sigmoid(opacity) to at most {OPACITY_RESET_MAX} and zeroed Adam opacity moments"
+                "Opacity reset at phase iteration {phase_iter}: clamped effective opacity to at most {OPACITY_RESET_MAX} and zeroed Adam opacity moments"
             );
         }
         slot.set(0, splats.clone());
