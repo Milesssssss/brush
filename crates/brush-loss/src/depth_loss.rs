@@ -42,9 +42,9 @@ pub fn inverse_depth_l1_mean(pred: &[f32], gt: &[f32]) -> f32 {
 /// Same reduction as [`inverse_depth_l1_mean`], on `[H, W]` tensors.
 ///
 /// `mask`, when set, is a per-pixel weight in `[0, 1]` (the ground-truth alpha
-/// in masked mode). A weight of `0` drops that pixel. The mean is taken over
-/// the sum of weights on valid targets, so a fractional mask counts partially.
-/// An all-zero weight, or no finite positive target, returns `0`.
+/// in masked mode). A weight of `0` drops that pixel. The mean is the weighted
+/// absolute error divided by the sum of those weights, including a sum between
+/// zero and one. Only an empty sum is replaced, and that case returns `0`.
 pub fn inverse_depth_l1(
     pred_depth: Tensor<2>,
     gt_depth: Tensor<2>,
@@ -71,7 +71,11 @@ pub fn inverse_depth_l1(
     }
 
     let abs_err = (disp_pred - disp_gt).abs() * weight.clone();
-    abs_err.sum() / weight.sum().clamp_min(1.0)
+    let total = weight.sum();
+    // Keep every positive weight sum, including one below 1. An empty sum
+    // would divide by zero; the numerator is already 0, so any stand-in works.
+    let empty = total.clone().lower_equal_elem(0.0);
+    abs_err.sum() / total.mask_fill(empty, 1.0)
 }
 
 /// Finite and strictly positive. `+Inf` fails the upper bound; `NaN` fails both.

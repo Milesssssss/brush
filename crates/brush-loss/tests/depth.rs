@@ -92,6 +92,75 @@ async fn masked_depth_loss_has_no_value_or_gradient_outside_the_mask() {
 }
 
 #[tokio::test]
+async fn fractional_mask_uses_the_weight_sum_as_the_denominator() {
+    let device =
+        burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+    // |1/2 - 1/4| = 0.25. Weight 0.5 makes the numerator 0.125 and the
+    // weighted mean 0.25. Dividing by 1 would report 0.125 instead.
+    let pred = Tensor::<2>::from_floats([[2.0]], &device).require_grad();
+    let gt = Tensor::<2>::from_floats([[4.0]], &device);
+    let mask = Tensor::<2>::from_floats([[0.5]], &device);
+    let loss = inverse_depth_l1(pred.clone(), gt, Some(mask));
+    let value = loss
+        .clone()
+        .into_scalar_async::<f32>()
+        .await
+        .expect("fractional loss");
+    assert!(
+        (value - 0.25).abs() < 1e-5,
+        "weight 0.5 should keep the weighted mean, got {value}"
+    );
+
+    let grads = loss.backward();
+    let grad = pred
+        .grad(&grads)
+        .expect("prediction should stay in the graph")
+        .into_data_async()
+        .await
+        .expect("grad readback")
+        .try_to_vec::<f32>()
+        .expect("f32");
+    // d|1/p - 1/4| / dp at p = 2 is -1/p^2 = -0.25. The weight cancels.
+    assert!(
+        (grad[0] - (-0.25)).abs() < 1e-4,
+        "fractional-mask gradient {grad:?}"
+    );
+}
+
+#[tokio::test]
+async fn all_zero_mask_has_zero_loss_and_zero_gradient() {
+    let device =
+        burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+    let pred = Tensor::<2>::from_floats([[2.0, 3.0]], &device).require_grad();
+    let gt = Tensor::<2>::from_floats([[4.0, 8.0]], &device);
+    let mask = Tensor::<2>::from_floats([[0.0, 0.0]], &device);
+    let loss = inverse_depth_l1(pred.clone(), gt, Some(mask));
+    let value = loss
+        .clone()
+        .into_scalar_async::<f32>()
+        .await
+        .expect("empty-mask loss");
+    assert!(
+        value.abs() < 1e-6,
+        "an all-zero mask should drop the depth term, got {value}"
+    );
+
+    let grads = loss.backward();
+    let grad = pred
+        .grad(&grads)
+        .expect("prediction should stay in the graph")
+        .into_data_async()
+        .await
+        .expect("grad readback")
+        .try_to_vec::<f32>()
+        .expect("f32");
+    assert!(
+        grad.iter().all(|g| g.abs() < 1e-6),
+        "all-zero mask gradient {grad:?}"
+    );
+}
+
+#[tokio::test]
 async fn expected_depth_detaches_alpha() {
     let device =
         burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
