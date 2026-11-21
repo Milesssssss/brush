@@ -10,7 +10,11 @@ pub mod train;
 mod adam_scaled;
 mod multinomial;
 mod quat_vec;
+mod split;
 mod stats;
+
+#[cfg(test)]
+mod refine_split;
 
 mod splat_init;
 

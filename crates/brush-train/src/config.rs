@@ -76,8 +76,9 @@ pub struct TrainConfig {
     pub growth_stop_iter: u32,
 
     /// Split any splat whose max screen-space extent exceeds this fraction of
-    /// the image dimension, shrinking the children so they land at (at most)
-    /// this size on screen. 0 disables.
+    /// the image dimension. Each split keeps at least half of the longest
+    /// axis, so a far-oversized splat reaches this size over several refines
+    /// instead of being replaced by two tiny fragments. 0 disables.
     #[arg(long, help_heading = "Refine options", default_value = "0.5")]
     pub split_at_screen_size: f32,
 
