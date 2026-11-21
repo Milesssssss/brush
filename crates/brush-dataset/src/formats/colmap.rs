@@ -343,20 +343,15 @@ async fn load_dataset_inner(
 
     // Wait for both halves.
     let (dataset, init) = tokio::join!(dataset, init);
-    let ((dataset, warnings, metric_scale), mut init_splat) = (dataset?, init);
+    let ((dataset, warnings, metric_scale), init_splat) = (dataset?, init);
 
-    if let Some(scale) = metric_scale
-        && let Some(splat) = init_splat.as_mut()
-    {
-        for m in &mut splat.data.means {
-            *m *= scale;
-        }
-    }
-
+    // The initializer is scaled once the caller has chosen it. A later PLY
+    // override is in this same frame and must receive the same scale.
     Ok(DatasetLoadResult {
         init_splat,
         dataset,
         warnings,
+        metric_scale,
     })
 }
 
@@ -1044,5 +1039,57 @@ mod tests {
             "training depth should be in metres, got {}",
             depth[5]
         );
+    }
+
+    /// `init.ply` is in the original reconstruction frame, so the public loader
+    /// must scale it after preferring it over `points3D`.
+    #[tokio::test]
+    async fn metric_scale_reaches_an_overriding_ply() {
+        let dir = tempfile::tempdir().unwrap();
+        write_metric_depth_dataset(dir.path()).await;
+        let ply = "\
+ply
+format ascii 1.0
+element vertex 1
+property float x
+property float y
+property float z
+property float scale_0
+property float scale_1
+property float scale_2
+end_header
+0 0 10 -1 -1 -1
+";
+        tokio::fs::write(dir.path().join("init.ply"), ply)
+            .await
+            .unwrap();
+
+        let result = load_dataset(
+            Arc::new(BrushVfs::from_path(dir.path()).await.unwrap()),
+            &LoadDatasetConfig {
+                estimate_metric_scale: true,
+                ..test_config(None)
+            },
+        )
+        .await
+        .unwrap();
+        assert_vec3_close(
+            result.dataset.train.views[0].camera.position,
+            glam::vec3(0.0, 0.0, 10.0),
+        );
+        let init = result.init_splat.expect("ply initializer");
+        assert_vec3_close(
+            glam::Vec3::from_slice(&init.data.means[0..3]),
+            glam::vec3(0.0, 0.0, 20.0),
+        );
+        let log_scales = init.data.log_scales.expect("ply log-scales");
+        let shift = 2.0f32.ln();
+        for scale in log_scales {
+            assert!(
+                (scale - (-1.0 + shift)).abs() < 1e-5,
+                "log-scale {scale}, expected {}",
+                -1.0 + shift
+            );
+        }
     }
 }

@@ -69,7 +69,9 @@ async fn depth_loss_moves_positions_not_opacity() {
     let alpha = diff_out.img.clone().slice(s![.., .., 3..4]);
     let rendered = expected_depth(accumulated, alpha).reshape([img_h, img_w]);
     let gt = Tensor::<2>::ones([img_h, img_w], &device) * 3.0;
-    let grads = splats.bwd_validate(inverse_depth_l1(rendered, gt)).await;
+    let grads = splats
+        .bwd_validate(inverse_depth_l1(rendered, gt, None))
+        .await;
 
     let transforms_grad = splats
         .transforms

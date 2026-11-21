@@ -4,7 +4,7 @@
 //! recovers expected depth, but that denominator is detached: depth error
 //! must move gaussians, not change how opaque they are.
 
-use burn::tensor::Tensor;
+use burn::tensor::{Bool, Tensor};
 
 /// Mean absolute error between inverse depths.
 ///
@@ -40,16 +40,46 @@ pub fn inverse_depth_l1_mean(pred: &[f32], gt: &[f32]) -> f32 {
 }
 
 /// Same reduction as [`inverse_depth_l1_mean`], on `[H, W]` tensors.
-pub fn inverse_depth_l1(pred_depth: Tensor<2>, gt_depth: Tensor<2>) -> Tensor<1> {
-    let pred_positive = pred_depth.clone().greater_elem(0.0).float();
-    let disp_pred = pred_depth.clamp_min(1e-8).recip() * pred_positive;
+///
+/// `mask`, when set, is a per-pixel weight in `[0, 1]` (the ground-truth alpha
+/// in masked mode). A weight of `0` drops that pixel. The mean is taken over
+/// the sum of weights on valid targets, so a fractional mask counts partially.
+/// An all-zero weight, or no finite positive target, returns `0`.
+pub fn inverse_depth_l1(
+    pred_depth: Tensor<2>,
+    gt_depth: Tensor<2>,
+    mask: Option<Tensor<2>>,
+) -> Tensor<1> {
+    let pred_ok = positive_finite(pred_depth.clone());
+    let gt_ok = positive_finite(gt_depth.clone());
+    // Replace invalid samples before the reciprocal so infinity and NaN never
+    // enter the subtraction. Invalid predictions then contribute disparity 0.
+    let disp_pred = pred_depth
+        .mask_fill(pred_ok.clone().bool_not(), 1.0)
+        .recip()
+        * pred_ok.float();
+    let disp_gt = gt_depth.mask_fill(gt_ok.clone().bool_not(), 1.0).recip();
 
-    let gt_valid = gt_depth.clone().greater_elem(0.0);
-    let valid = gt_valid.float();
-    let disp_gt = gt_depth.clamp_min(1e-8).recip();
+    let mut weight = gt_ok.float();
+    if let Some(mask) = mask {
+        let mask_finite = mask
+            .clone()
+            .greater_equal_elem(0.0)
+            .bool_and(mask.clone().lower_equal_elem(1.0));
+        let safe_mask = mask.mask_fill(mask_finite.bool_not(), 0.0).clamp(0.0, 1.0);
+        weight = weight * safe_mask;
+    }
 
-    let abs_err = (disp_pred - disp_gt).abs() * valid.clone();
-    abs_err.sum() / valid.sum().clamp_min(1.0)
+    let abs_err = (disp_pred - disp_gt).abs() * weight.clone();
+    abs_err.sum() / weight.sum().clamp_min(1.0)
+}
+
+/// Finite and strictly positive. `+Inf` fails the upper bound; `NaN` fails both.
+fn positive_finite(values: Tensor<2>) -> Tensor<2, Bool> {
+    values
+        .clone()
+        .greater_elem(0.0)
+        .bool_and(values.lower_equal_elem(f32::MAX))
 }
 
 /// `accumulated / alpha`, with alpha detached.
@@ -90,5 +120,17 @@ mod tests {
     #[test]
     fn identical_positive_depths_have_zero_loss() {
         assert_eq!(inverse_depth_l1_mean(&[1.5, 8.0], &[1.5, 8.0]), 0.0);
+    }
+
+    #[test]
+    fn non_finite_targets_are_ignored() {
+        assert_eq!(
+            inverse_depth_l1_mean(&[2.0, 2.0, 2.0, 2.0], &[2.0, f32::INFINITY, f32::NAN, 0.0]),
+            0.0
+        );
+        assert_eq!(
+            inverse_depth_l1_mean(&[1.0, 1.0], &[f32::INFINITY, f32::NAN]),
+            0.0
+        );
     }
 }

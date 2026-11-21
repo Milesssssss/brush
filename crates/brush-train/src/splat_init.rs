@@ -128,6 +128,8 @@ pub fn create_random_splats(
 }
 
 pub fn bounds_from_pos(percentile: f32, means: &[f32]) -> BoundingBox {
+    // `chunks_exact_to_as_chunks` exists only on newer clippy. CI is 1.95.
+    #[allow(unknown_lints, clippy::chunks_exact_to_as_chunks)]
     let (mut x_vals, mut y_vals, mut z_vals): (Vec<f32>, Vec<f32>, Vec<f32>) = means
         .chunks_exact(3)
         .map(|chunk| (chunk[0], chunk[1], chunk[2]))

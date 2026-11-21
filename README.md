@@ -37,7 +37,9 @@ COLMAP datasets can include a `depth` folder of single-channel float32 TIFF dept
 
 `--depth-loss-weight` (default `0`) adds an L1 loss on inverse depth, `mean(|1/rendered − 1/ground truth|)`, over the valid pixels. Leaving it at `0` keeps the existing training loss and the 4-channel render. The rendered depth is the alpha-weighted sum divided by accumulated alpha, and that alpha is detached so the loss moves gaussians instead of changing opacity.
 
-COLMAP reconstructions have an arbitrary scale. `--estimate-metric-scale` (default off) estimates one global scale from the depth maps and the projected landmarks, then applies it to the camera positions and the initial point cloud. It does nothing when the flag is off or when no depth maps are present. `--units-per-meter` is applied after that scale.
+COLMAP reconstructions have an arbitrary scale. `--estimate-metric-scale` (default off) estimates one global scale from the depth maps and the projected landmarks, then applies it to the camera positions and the initial point cloud. A PLY used as the initializer, including `init.ply`, is treated as being in that same original reconstruction frame: its means are multiplied by the scale and its log-scales shift by `ln(scale)`. It does nothing when the flag is off or when no depth maps are present. `--units-per-meter` is applied after that scale.
+
+Masked views weight the depth loss by the same mask alpha as the RGB loss, so pixels outside the silhouette do not pull geometry.
 
 In the viewer, **Depth map** shows the rendered expected depth with a turbo colormap. In the dataset panel, **Depth** shows the loaded ground-truth map for the current view, with the same colormap.
 

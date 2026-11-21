@@ -391,7 +391,20 @@ impl SplatTrainer {
                 // error cannot be reduced by changing opacity.
                 let alpha = pred_image.clone().slice(s![.., .., 3..4]);
                 let rendered = expected_depth(accumulated, alpha).reshape([img_h, img_w]);
-                loss = loss + inverse_depth_l1(rendered, gt_depth) * self.config.depth_loss_weight;
+                // Masked views already ignore RGB outside the silhouette. Depth
+                // uses the same alpha byte as a per-pixel weight.
+                let depth_mask = masked_alpha.then(|| {
+                    let alpha_byte = gt_packed
+                        .clone()
+                        .bitwise_right_shift_scalar(24)
+                        .bitwise_and_scalar(0xFF)
+                        .float()
+                        .div_scalar(255.0);
+                    Tensor::from_inner(alpha_byte)
+                });
+                loss = loss
+                    + inverse_depth_l1(rendered, gt_depth, depth_mask)
+                        * self.config.depth_loss_weight;
             }
 
             // Strip the autodiff graph off the loss so consumers can read the

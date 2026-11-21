@@ -20,6 +20,10 @@ pub struct DatasetLoadResult {
     pub init_splat: Option<SplatMessage>,
     pub dataset: Dataset,
     pub warnings: Vec<String>,
+    /// Scale that maps the original reconstruction into the depth maps' units.
+    /// Applied to the chosen initializer (points or PLY) after that choice.
+    /// `None` when scale estimation was not used.
+    pub metric_scale: Option<f32>,
 }
 
 #[derive(Error, Debug)]
@@ -97,7 +101,7 @@ pub async fn load_dataset(
         .find(|p| p.file_name().is_some_and(|n| n == "init.ply"))
         .or_else(|| ply_paths.last());
 
-    let init_splat = if let Some(main_ply) = main_ply {
+    let mut init_splat = if let Some(main_ply) = main_ply {
         log::info!("Using ply {main_ply:?} as initial point cloud.");
         let reader = vfs
             .reader_at_path(main_ply)
@@ -107,13 +111,38 @@ pub async fn load_dataset(
     } else {
         result.init_splat
     };
+    // The PLY, like the COLMAP point cloud, is in the original reconstruction
+    // frame. Apply the depth-derived scale after choosing which one is used,
+    // so an overriding PLY is not left behind the scaled cameras.
+    if let Some(scale) = result.metric_scale
+        && let Some(splat) = init_splat.as_mut()
+    {
+        apply_reconstruction_scale(splat, scale);
+    }
 
     let result = DatasetLoadResult {
         init_splat,
         dataset: result.dataset,
         warnings: result.warnings,
+        metric_scale: result.metric_scale,
     };
     scale_to_meters(result, load_args.units_per_meter)
+}
+
+/// Multiply an initializer's positions by `scale` and shift log-scales by `ln(scale)`.
+fn apply_reconstruction_scale(splat: &mut SplatMessage, scale: f32) {
+    if !(scale.is_finite() && scale > 0.0) || scale == 1.0 {
+        return;
+    }
+    for mean in &mut splat.data.means {
+        *mean *= scale;
+    }
+    if let Some(log_scales) = splat.data.log_scales.as_mut() {
+        let shift = scale.ln();
+        for log_scale in log_scales {
+            *log_scale += shift;
+        }
+    }
 }
 
 /// Convert a dataset from its own units to metres by dividing every position
