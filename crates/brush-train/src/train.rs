@@ -32,8 +32,9 @@ pub const BOUND_PERCENTILE: f32 = 0.8;
 /// stop, so the tail of the phase can settle.
 pub const REFINE_STOP_PROGRESS: f32 = 0.95;
 
-/// Activated-opacity cap used by [`SplatTrainer::reset_opacity`].
-/// `sigmoid(raw)` is clamped with `min(a, OPACITY_RESET_MAX)`.
+/// Opacity cap used by [`SplatTrainer::reset_opacity`].
+/// Applied to the opacity the renderer uses: `sigmoid(raw)` times the
+/// 3D-filter energy compensation when a scale floor is attached.
 pub const OPACITY_RESET_MAX: f32 = 0.01;
 
 const MIN_OPACITY: f32 = 1.0 / 255.0;
@@ -143,6 +144,38 @@ fn clamp_raw_opacity(raw: Tensor<1>) -> Tensor<1> {
     let above = sigmoid(raw.clone()).greater_elem(OPACITY_RESET_MAX);
     let reset_raw = Tensor::zeros(raw.dims(), &raw.device()).add_scalar(opacity_reset_raw_value());
     raw.mask_where(above, reset_raw)
+}
+
+/// Energy compensation `Π s / sqrt(s² + f²)`, the same product `fold_min_scale`
+/// folds into opacity. `transforms` is `[N, 10]`, `min_scale` is `[N]`.
+fn opacity_floor_coef(transforms: &Tensor<2>, min_scale: &Tensor<1>) -> Tensor<1> {
+    let n = transforms.dims()[0] as i32;
+    let min_scale = min_scale.clone().to_device(&transforms.device());
+    let log_scales = transforms.clone().slice(s![.., 7..10]);
+    let s2 = log_scales.clone().mul_scalar(2.0).exp();
+    let f2 = min_scale.clone().mul(min_scale).reshape([n, 1]);
+    let new_log = s2.add(f2).log().mul_scalar(0.5);
+    log_scales.sub(new_log).sum_dim(1).exp().reshape([n])
+}
+
+/// Cap the filter-compensated opacity at [`OPACITY_RESET_MAX`] and solve for
+/// the raw parameter: `sigmoid(raw') * coef = min(sigmoid(raw) * coef, cap)`.
+/// Rows whose compensated opacity is already at or below the cap keep their
+/// raw bits, so a faint splat is not brightened. Scales and the floor stay put.
+fn clamp_raw_opacity_filtered(
+    raw: Tensor<1>,
+    transforms: &Tensor<2>,
+    min_scale: &Tensor<1>,
+) -> Tensor<1> {
+    let coef = opacity_floor_coef(transforms, min_scale);
+    let effective = sigmoid(raw.clone()).mul(coef.clone());
+    let above = effective.greater_elem(OPACITY_RESET_MAX);
+    // `coef > cap` whenever `effective > cap` (effective ≤ coef), so the
+    // target sigmoid `cap / coef` is in (0, 1). The clamp only guards rows
+    // the mask does not write.
+    let target = coef.clamp_min(1e-12).recip().mul_scalar(OPACITY_RESET_MAX);
+    let target_raw = inv_sigmoid(target.clamp(1e-6, 1.0 - 1e-6));
+    raw.mask_where(above, target_raw)
 }
 
 /// Same bookends as the refine gate in the training loop: not at iteration 0,
@@ -276,8 +309,14 @@ impl SplatTrainer {
         opacity_reset_due(phase_iter, phase_progress, self.config.opacity_reset_every)
     }
 
-    /// Clamp activated opacity to at most [`OPACITY_RESET_MAX`] and replace
-    /// the opacity Adam moments with zeros.
+    /// Clamp opacity to at most [`OPACITY_RESET_MAX`] and replace the opacity
+    /// Adam moments with zeros.
+    ///
+    /// The cap is the opacity after the 3D-filter energy compensation when a
+    /// scale floor is attached (`sigmoid(raw) * coef`). The raw parameter is
+    /// solved so the compensated value lands on the cap; scales and the floor
+    /// are not baked. Splats already at or below the cap are left unchanged.
+    /// Without a floor this is `min(sigmoid(raw), cap)`.
     ///
     /// The Adam step counter is left unchanged. That matches replacing the
     /// parameter tensor in the optimizer: `exp_avg` / `exp_avg_sq` are cleared
@@ -286,7 +325,14 @@ impl SplatTrainer {
     /// SH are not touched. A missing optimizer (no step yet) still clamps the
     /// parameters; the next step then starts from fresh moments.
     pub fn reset_opacity(&mut self, mut splats: Splats) -> Splats {
-        splats.raw_opacities = splats.raw_opacities.map(clamp_raw_opacity);
+        splats.raw_opacities = if let Some(floor) = splats.min_scale.clone() {
+            let transforms = splats.transforms.val();
+            splats
+                .raw_opacities
+                .map(|raw| clamp_raw_opacity_filtered(raw, &transforms, &floor))
+        } else {
+            splats.raw_opacities.map(clamp_raw_opacity)
+        };
         if let Some(optim) = self.optim.as_mut() {
             optim
                 .opacities
@@ -973,6 +1019,7 @@ fn sample_background_color<R: rand::Rng + ?Sized>(
 mod tests {
     use super::*;
     use crate::adam_scaled::MomentumState;
+    use crate::stats::RefineRecord;
     use brush_render::gaussian_splats::SplatRenderMode;
     use hashbrown::HashSet;
     use wasm_bindgen_test::wasm_bindgen_test;
@@ -1196,5 +1243,159 @@ mod tests {
                 "decay is skipped while the reset is enabled"
             );
         }
+    }
+
+    /// Small splats sit near the 3D-filter floor, so compensation `coef < 1`.
+    /// Capping the raw sigmoid at 0.01 and then multiplying by `coef` drops a
+    /// healthy splat under the `1/255` projection cutoff. The reset has to cap
+    /// the compensated opacity instead, and must not brighten a splat that is
+    /// already under the cap. The next refine must actually prune something
+    /// else, or the empty-set guard would hide a total cull.
+    #[wasm_bindgen_test(unsupported = tokio::test)]
+    async fn opacity_reset_caps_effective_opacity_when_min_scale_is_set() {
+        let device: Device = brush_cube::test_helpers::test_device().await.into();
+        let opt_device = device.clone().inner();
+        let config = TrainConfig {
+            opacity_reset_every: 3000,
+            // Keep the follow-up refine to a pure prune.
+            split_at_screen_size: 0.0,
+            growth_stop_iter: 0,
+            ..TrainConfig::default()
+        };
+
+        // s = f = 0.001 on every axis → coef = (1/√2)³ ≈ 0.35355.
+        // Raw sigmoid 0.5 is effective ≈ 0.177. An uncompensated cap of 0.01
+        // would leave effective ≈ 0.00354, below 1/255.
+        let floor = 0.001f32;
+        let coef = (1.0f32 / 2.0f32.sqrt()).powi(3);
+        let project_cutoff = 1.0f32 / 255.0;
+        assert!((0.5 * coef - 0.1767767).abs() < 1e-5);
+        assert!(
+            OPACITY_RESET_MAX * coef < project_cutoff,
+            "capping raw sigmoid would cull this splat after compensation"
+        );
+
+        let n = 3usize;
+        let log_small = floor.ln();
+        let faint_raw = (0.001f32 / (1.0 - 0.001)).ln();
+        // 0: small but healthy (sigmoid 0.5). 1: large anchor (sigmoid 0.5).
+        // 2: already faint; effective opacity stays under the cap and under 1/255.
+        let log_scales = Tensor::<1>::from_floats(
+            [
+                log_small, log_small, log_small, 0.0, 0.0, 0.0, log_small, log_small, log_small,
+            ],
+            &device,
+        )
+        .reshape([n, 3]);
+        let rots = Tensor::<1>::from_floats(
+            [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+            &device,
+        )
+        .reshape([n, 4]);
+        let mut splats = Splats::from_tensor_data(
+            Tensor::zeros([n, 3], &device),
+            rots,
+            log_scales,
+            Tensor::zeros([n, 1, 3], &device),
+            Tensor::<1>::from_floats([0.0, 0.0, faint_raw], &device),
+            SplatRenderMode::Default,
+        )
+        .with_min_scale(Tensor::<1>::from_floats([floor, floor, floor], &device));
+
+        let scales_before = to_vec(splats.log_scales()).await;
+        let mut trainer = test_trainer(&config, &device);
+        let mut optim = SplatOptim::new(&config, splats.sh_degree(), &opt_device);
+        optim.opacities.momentum = Some(MomentumState {
+            moment_1: Tensor::<1>::from_floats([1.0, -2.0, 3.0], &opt_device),
+            moment_2: Tensor::<1>::from_floats([0.4, 0.5, 0.6], &opt_device),
+            time: 42,
+        });
+        let transform_m1 = Tensor::<2>::ones([n, 10], &opt_device);
+        let transform_m1_before = to_vec(transform_m1.clone()).await;
+        optim.transforms.momentum = Some(MomentumState {
+            moment_1: transform_m1,
+            moment_2: Tensor::<2>::ones([n, 10], &opt_device),
+            time: 7,
+        });
+        trainer.optim = Some(optim);
+
+        splats = trainer.reset_opacity(splats);
+
+        let effective = to_vec(splats.opacities()).await;
+        assert!(
+            (effective[0] - OPACITY_RESET_MAX).abs() < 1e-4,
+            "small splat effective opacity, got {}",
+            effective[0]
+        );
+        assert!(
+            (effective[1] - OPACITY_RESET_MAX).abs() < 1e-4,
+            "anchor effective opacity, got {}",
+            effective[1]
+        );
+        assert!(
+            effective[0] >= project_cutoff && effective[1] >= project_cutoff,
+            "capped splats must stay visible to the projector"
+        );
+        assert!(
+            effective[2] < project_cutoff,
+            "faint splat must not be brightened, got {}",
+            effective[2]
+        );
+        let raw_after = to_vec(splats.raw_opacities.val()).await;
+        assert_eq!(
+            raw_after[2].to_bits(),
+            faint_raw.to_bits(),
+            "faint raw opacity is left untouched"
+        );
+        assert_eq!(
+            to_vec(splats.log_scales()).await,
+            scales_before,
+            "reset does not bake the scale floor"
+        );
+        assert!(splats.min_scale.is_some(), "floor stays attached");
+
+        let optim = trainer.optim.as_ref().expect("optim still installed");
+        let opac = optim.opacities.momentum.as_ref().expect("opacity moments");
+        assert_eq!(opac.time, 42, "adam step counter is kept");
+        for v in to_vec(opac.moment_1.clone()).await {
+            assert_eq!(v.to_bits(), 0, "exp_avg zeroed");
+        }
+        for v in to_vec(opac.moment_2.clone()).await {
+            assert_eq!(v.to_bits(), 0, "exp_avg_sq zeroed");
+        }
+        let transforms = optim
+            .transforms
+            .momentum
+            .as_ref()
+            .expect("transform moments");
+        assert_eq!(transforms.time, 7);
+        assert_eq!(
+            to_vec(transforms.moment_1.clone()).await,
+            transform_m1_before
+        );
+
+        trainer.refine_record = Some(RefineRecord::new(
+            splats.num_splats(),
+            &splats.device().inner(),
+        ));
+        let (splats, stats) = trainer.refine(100, splats).await;
+        assert_eq!(
+            stats.num_pruned, 1,
+            "only the already-faint splat is pruned"
+        );
+        assert_eq!(
+            splats.num_splats(),
+            2,
+            "the small splat survives alongside the anchor"
+        );
+        let survived = to_vec(splats.opacities()).await;
+        assert!(survived.iter().all(|a| *a >= project_cutoff));
+        let baked_scale = to_vec(splats.scales()).await;
+        let expected_small = floor * 2.0f32.sqrt();
+        assert!(
+            (baked_scale[0] - expected_small).abs() < 1e-5,
+            "surviving small splat keeps its floored scale, got {}",
+            baked_scale[0]
+        );
     }
 }

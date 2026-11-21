@@ -94,10 +94,12 @@ pub struct TrainConfig {
     /// existing runs stay unchanged.
     ///
     /// When set to `N > 0`, every `N` phase iterations — not at iteration 0,
-    /// and not after 95% of the phase, the same cutoff as refine —
-    /// `sigmoid(opacity)` is clamped to at most `0.01` and the Adam moments
-    /// for opacity are zeroed. The step counter is kept. While the reset is
-    /// enabled, [`TrainConfig::opac_decay`] is skipped so the two do not stack.
+    /// and not after 95% of the phase, the same cutoff as refine — opacity is
+    /// clamped to at most `0.01`. The cap is the opacity after the 3D-filter
+    /// compensation, and splats already at or below the cap are left
+    /// unchanged. Adam moments for opacity are zeroed; the step counter is
+    /// kept. While the reset is enabled, [`TrainConfig::opac_decay`] is
+    /// skipped so the two do not stack.
     #[arg(long, help_heading = "Training options", default_value = "0")]
     pub opacity_reset_every: u32,
 
