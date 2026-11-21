@@ -362,7 +362,7 @@ impl AnimationPanel {
                 }
             }
 
-            resp.clone().context_menu(|ui| {
+            resp.context_menu(|ui| {
                 if ui.button("Remove keyframe").clicked() {
                     to_remove = Some(idx);
                     ui.close();

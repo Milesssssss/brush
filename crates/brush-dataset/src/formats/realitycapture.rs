@@ -155,6 +155,7 @@ async fn read_dataset_inner(
             camera,
             image,
             image_size,
+            depth: None,
         });
     }
 
@@ -164,6 +165,7 @@ async fn read_dataset_inner(
         init_splat: None,
         dataset: Dataset::from_views(train_views, eval_views),
         warnings,
+        metric_scale: None,
     })
 }
 

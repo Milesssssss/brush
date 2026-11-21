@@ -89,6 +89,7 @@ impl SplatOps for Fusion<CubeBackend> {
         refine_weight: FloatTensor<Self>,
         coeffs_grad_sq: FloatTensor<Self>,
         render_mode: SplatRenderMode,
+        raster_mode: crate::gaussian_splats::RasterizationMode,
         background: Vec3,
         pass: crate::gaussian_splats::RasterPass,
     ) -> RenderOutput<Self> {
@@ -127,6 +128,7 @@ impl SplatOps for Fusion<CubeBackend> {
             base_refine_weight,
             base_coeffs_grad_sq,
             render_mode,
+            raster_mode,
             background,
             pass,
         )

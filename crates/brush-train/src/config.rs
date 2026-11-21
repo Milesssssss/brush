@@ -104,6 +104,13 @@ pub struct TrainConfig {
     #[arg(long, help_heading = "Refine options", default_value = "0.0")]
     pub lpips_loss_weight: f32,
 
+    /// Weight of the inverse-depth L1 loss. `0` (the default) disables it, so
+    /// training is unchanged unless depth maps are loaded and this is raised.
+    /// The loss compares `1 / rendered depth` with `1 / ground-truth depth`
+    /// on pixels whose ground-truth depth is positive.
+    #[arg(long, help_heading = "Training options", default_value = "0.0")]
+    pub depth_loss_weight: f32,
+
     /// Base background color (R,G,B) used during training.
     #[arg(
         long,
