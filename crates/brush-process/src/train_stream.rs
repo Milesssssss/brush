@@ -14,7 +14,9 @@ use brush_train::{
     lod::{compute_pup_scores, decimate_to_count},
     msg::RefineStats,
     to_init_splats,
-    train::{BOUND_PERCENTILE, SplatTrainer, get_splat_bounds},
+    train::{
+        BOUND_PERCENTILE, OPACITY_RESET_MAX, REFINE_STOP_PROGRESS, SplatTrainer, get_splat_bounds,
+    },
 };
 use brush_vfs::BrushVfs;
 use burn::module::Module;
@@ -269,6 +271,13 @@ pub(crate) async fn train_stream(
         process_config.vram_dump_slow_factor,
     );
 
+    if train_stream_config.train_config.opacity_reset_every > 0 {
+        let every = train_stream_config.train_config.opacity_reset_every;
+        log::info!(
+            "Opacity reset every {every} steps (cap {OPACITY_RESET_MAX}). Per-refine opac_decay is skipped while this is on."
+        );
+    }
+
     log::info!("Start training loop.");
     for iter in start_iter..train_stream_config.train_config.total_iters() {
         let target_lod = if lod_levels == 0 || iter < training_steps {
@@ -383,7 +392,7 @@ pub(crate) async fn train_stream(
         let refine_start = Instant::now();
         let did_refine = phase_iter > 0
             && phase_iter.is_multiple_of(train_stream_config.train_config.refine_every)
-            && phase_progress <= 0.95;
+            && phase_progress <= REFINE_STOP_PROGRESS;
         let refine = if did_refine {
             let (new_splats, refine_stats) = trainer.refine(iter, splats).await;
             splats = new_splats;
@@ -398,6 +407,14 @@ pub(crate) async fn train_stream(
                 total_splats: splats.num_splats(),
             }
         };
+        // After prune/split when both land on this step. No-op for the whole
+        // run when the flag is 0, which is what keeps existing runs unchanged.
+        if trainer.opacity_reset_due(phase_iter, phase_progress) {
+            splats = trainer.reset_opacity(splats);
+            log::info!(
+                "Opacity reset at phase iteration {phase_iter}: clamped effective opacity to at most {OPACITY_RESET_MAX} and zeroed Adam opacity moments"
+            );
+        }
         slot.set(0, splats.clone());
         let refine_dur = refine_start.elapsed();
 

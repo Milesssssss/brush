@@ -193,4 +193,31 @@ mod tests {
         assert_eq!(parsed.load_config.max_frames, Some(10));
         assert_eq!(parsed.process_config.seed, 123);
     }
+
+    #[wasm_bindgen_test(unsupported = test)]
+    fn opacity_reset_every_round_trips_and_is_absent_by_default() {
+        let default_args = config_to_args(&TrainStreamConfig::default());
+        assert!(
+            default_args
+                .iter()
+                .all(|arg| !arg.contains("opacity-reset")),
+            "default args must not mention the reset, got {default_args:?}"
+        );
+
+        let mut config = TrainStreamConfig::default();
+        config.train_config.opacity_reset_every = 3000;
+        let args = config_to_args(&config);
+        assert!(
+            args.iter().any(|arg| arg == "--opacity-reset-every 3000"),
+            "got {args:?}"
+        );
+
+        let mut cli_args = vec!["brush".to_owned()];
+        for arg in &args {
+            cli_args.extend(arg.split_whitespace().map(|s| s.to_owned()));
+        }
+        let parsed = TrainStreamConfig::try_parse_from(&cli_args).expect("parses");
+        assert_eq!(parsed.train_config.opacity_reset_every, 3000);
+        assert!((parsed.train_config.opac_decay - 0.004).abs() < 1e-6);
+    }
 }
