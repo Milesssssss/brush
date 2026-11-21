@@ -67,6 +67,16 @@ Fraction of “needs growth” candidates that actually split/clone. Raise for m
 
 Gently pushes opacity down so weak splats can be pruned. Slightly higher decay can keep counts down; too high and you lose coverage.
 
+Skipped for the whole run when `--opacity-reset-every` is enabled. The decay is a slow stand-in for a reset; applying both would stack two downward pressures. Leave the reset at `0` to keep this decay.
+
+### `--opacity-reset-every` (default `0`)
+
+Opt-in periodic opacity reset. `0` leaves training unchanged, including `--opac-decay`.
+
+When set to `N > 0`, every `N` phase iterations (not at step 0, and not after 95% of the phase — the same cutoff as refine) each splat's opacity is clamped to `min(a, 0.01)` and the Adam moments for opacity are zeroed. The cap is the opacity after the 3D-filter compensation when a scale floor is attached, and the raw parameter is solved so that compensated value hits the cap. Splats already at or below `0.01` are left unchanged, so a faint splat is not brightened, and the reset does not bake scales. The Adam step counter is kept, so the first updates after a reset stay small instead of immediately walking opacity back up.
+
+`N` does not have to be a multiple of `--refine-every`. On a step that also refines, the reset runs after prune and split. While the reset is on, `--opac-decay` is not applied.
+
 ## VRAM and memory
 
 VRAM scales mainly with **resolution × splat count × SH degree**, plus the dataset image cache.
