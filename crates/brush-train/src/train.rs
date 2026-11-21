@@ -238,6 +238,15 @@ impl SplatTrainer {
         self.view_cams = view_cams;
     }
 
+    /// Install refine statistics without a training step.
+    ///
+    /// Tests use this to drive split/prune from known screen sizes. Production
+    /// fills the same record from `step`.
+    #[cfg(test)]
+    pub(crate) fn testing_set_refine_record(&mut self, record: crate::stats::RefineRecord) {
+        self.refine_record = Some(record);
+    }
+
     /// Drop the GPU-side optimizer momentum and refine statistics, e.g. ahead
     /// of a memory compaction. Both re-initialize lazily on the next step, so
     /// only call this when the state has been checkpointed (or is disposable).
@@ -566,10 +575,15 @@ impl SplatTrainer {
         }
 
         // Force-split splats that are too big on screen (every refine). Rather
-        // than killing them (the old `kill_at_screen_size`), we split them and
-        // shrink the children. One split at most halves an axis; later refines
-        // bring them down to `split_at_screen_size`. Capped by the remaining
-        // `max_splats` budget.
+        // than killing them, we split them. One split keeps at least half of
+        // each axis (`k >= 1/2`); a parent more than twice the cap needs later
+        // refines to reach `split_at_screen_size`.
+        //
+        // Budget is how many new splats still fit under `max_splats`. With no
+        // free slot the parent is left unchanged — there is no fallback to an
+        // unbounded shrink. Spending the last slot on a parent that is still
+        // over 2× the cap leaves both children oversized until a later refine
+        // has room again (usually after a prune).
         let pre_oversized = split_inds.len();
         if self.config.split_at_screen_size > 0.0 {
             let oversized = refiner.above_screen_size(self.config.split_at_screen_size);

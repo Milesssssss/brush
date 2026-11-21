@@ -13,6 +13,9 @@ mod quat_vec;
 mod split;
 mod stats;
 
+#[cfg(test)]
+mod refine_split;
+
 mod splat_init;
 
 pub use splat_init::{RandomSplatsConfig, create_random_splats, to_init_splats};
