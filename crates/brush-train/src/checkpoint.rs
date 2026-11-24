@@ -72,9 +72,9 @@ async fn host_data<const D: usize>(t: Tensor<D>) -> anyhow::Result<TensorData> {
         .await
         .map_err(|e| anyhow::anyhow!("Reading tensor for checkpoint: {e:?}"))?;
     anyhow::ensure!(
-        data.dtype == DType::F32,
+        data.dtype() == DType::F32,
         "Checkpoint tensors must be f32, got {:?}",
-        data.dtype
+        data.dtype()
     );
     Ok(data)
 }
@@ -144,7 +144,7 @@ pub async fn checkpoint_to_bytes(
     let views = entries
         .iter()
         .map(|(name, data)| {
-            TensorView::new(Dtype::F32, data.shape.to_vec(), data.as_bytes())
+            TensorView::new(Dtype::F32, data.shape().to_vec(), data.as_bytes())
                 .map(|view| (*name, view))
                 .map_err(|e| anyhow::anyhow!("Building checkpoint tensor {name}: {e:?}"))
         })
