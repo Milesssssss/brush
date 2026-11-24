@@ -223,6 +223,14 @@ fn draw_training(ui: &mut Ui, args: &mut TrainStreamConfig, enabled: bool) {
             false,
             enabled,
         );
+        slider(
+            ui,
+            &mut tc.depth_loss_weight,
+            0.0..=1.0,
+            "Inverse-depth loss weight (0 disables)",
+            false,
+            enabled,
+        );
     });
 
     ui.collapsing("Background", |ui| {
@@ -325,6 +333,17 @@ fn draw_dataset(ui: &mut Ui, args: &mut TrainStreamConfig, enabled: bool) {
         "",
         false,
         enabled,
+    );
+
+    ui.add_enabled(
+        enabled,
+        egui::Checkbox::new(
+            &mut args.load_config.estimate_metric_scale,
+            "Estimate metric scale from depth maps",
+        ),
+    )
+    .on_hover_text(
+        "COLMAP only. Uses depth maps and projected landmarks. Off by default, and skipped when no depth maps are present.",
     );
 
     ui.label("Dataset units per metre");

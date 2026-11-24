@@ -3,6 +3,7 @@ pub mod camera_controls;
 
 pub mod ui_process;
 
+mod depth_bar;
 pub mod log_panel;
 mod panels;
 mod scene;

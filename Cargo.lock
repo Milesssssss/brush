@@ -1239,6 +1239,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 2.0.21",
+ "tiff",
  "tokio",
  "tracing",
  "wasm-bindgen-test",

@@ -20,6 +20,10 @@ pub struct DatasetLoadResult {
     pub init_splat: Option<SplatMessage>,
     pub dataset: Dataset,
     pub warnings: Vec<String>,
+    /// Scale that maps the original reconstruction into the depth maps' units.
+    /// Applied to the chosen initializer (points or PLY) after that choice.
+    /// `None` when scale estimation was not used.
+    pub metric_scale: Option<f32>,
 }
 
 #[derive(Error, Debug)]
@@ -97,7 +101,7 @@ pub async fn load_dataset(
         .find(|p| p.file_name().is_some_and(|n| n == "init.ply"))
         .or_else(|| ply_paths.last());
 
-    let init_splat = if let Some(main_ply) = main_ply {
+    let mut init_splat = if let Some(main_ply) = main_ply {
         log::info!("Using ply {main_ply:?} as initial point cloud.");
         let reader = vfs
             .reader_at_path(main_ply)
@@ -107,13 +111,38 @@ pub async fn load_dataset(
     } else {
         result.init_splat
     };
+    // The PLY, like the COLMAP point cloud, is in the original reconstruction
+    // frame. Apply the depth-derived scale after choosing which one is used,
+    // so an overriding PLY is not left behind the scaled cameras.
+    if let Some(scale) = result.metric_scale
+        && let Some(splat) = init_splat.as_mut()
+    {
+        apply_reconstruction_scale(splat, scale);
+    }
 
     let result = DatasetLoadResult {
         init_splat,
         dataset: result.dataset,
         warnings: result.warnings,
+        metric_scale: result.metric_scale,
     };
     scale_to_meters(result, load_args.units_per_meter)
+}
+
+/// Multiply an initializer's positions by `scale` and shift log-scales by `ln(scale)`.
+fn apply_reconstruction_scale(splat: &mut SplatMessage, scale: f32) {
+    if !(scale.is_finite() && scale > 0.0) || scale == 1.0 {
+        return;
+    }
+    for mean in &mut splat.data.means {
+        *mean *= scale;
+    }
+    if let Some(log_scales) = splat.data.log_scales.as_mut() {
+        let shift = scale.ln();
+        for log_scale in log_scales {
+            *log_scale += shift;
+        }
+    }
 }
 
 /// Convert a dataset from its own units to metres by dividing every position
@@ -171,7 +200,10 @@ fn scale_to_meters(
 /// are skipped so an image never resolves to its own mask.
 fn find_image_by_name<'a>(vfs: &'a BrushVfs, name: &str) -> Option<&'a Path> {
     vfs.files_ending_in(name)
-        .filter(|p| !p.iter().any(|f| f == "masks"))
+        .filter(|p| {
+            !p.iter()
+                .any(|f| f == "masks" || f.eq_ignore_ascii_case("depth"))
+        })
         .min()
 }
 
@@ -199,6 +231,45 @@ fn split_eval_every(
         } else {
             Either::Left(v)
         }
+    })
+}
+
+/// Locate the `points3d.{txt,bin}` belonging to one COLMAP reconstruction.
+pub(crate) fn find_points3d_path<'a>(
+    vfs: &'a BrushVfs,
+    points_dir: &'a Path,
+) -> Option<(&'a Path, bool)> {
+    let path = vfs
+        .files_ending_in("points3d.txt")
+        .chain(vfs.files_ending_in("points3d.bin"))
+        .find(|p| p.parent() == Some(points_dir))?;
+    let is_binary = matches!(path.extension().and_then(|e| e.to_str()), Some("bin"));
+    Some((path, is_binary))
+}
+
+/// Locate a per-image depth map in a `depth` directory, matched by stem.
+///
+/// `images/foo/bar.png` matches `depth/foo/bar.tiff` and `depth/bar.tiff`.
+pub(crate) fn find_depth_path<'a>(vfs: &'a BrushVfs, path: &'a Path) -> Option<&'a Path> {
+    let search_name = path.file_name().expect("File must have a name");
+    let search_stem = path.file_stem().expect("File must have a name");
+
+    vfs.iter_files().find(|candidate| {
+        let Some(stem) = candidate.file_stem() else {
+            return false;
+        };
+        if !(stem.eq_ignore_ascii_case(search_name) || stem.eq_ignore_ascii_case(search_stem)) {
+            return false;
+        }
+        let depth_idx = candidate
+            .components()
+            .position(|c| c.as_os_str().eq_ignore_ascii_case("depth"));
+        depth_idx.is_some_and(|idx| {
+            let candidate_components: Vec<_> = candidate.components().collect();
+            let path_dir_components: Vec<_> = path.parent().unwrap().components().collect();
+            let depth_dir_subpath = &candidate_components[idx + 1..candidate_components.len() - 1];
+            path_dir_components.ends_with(depth_dir_subpath)
+        })
     })
 }
 
@@ -311,6 +382,33 @@ mod tests {
             PathBuf::from("masks/foo/img.png"),
         ]);
         assert_eq!(find_mask_path(&vfs, Path::new("images/baz/img.png")), None);
+    }
+
+    #[wasm_bindgen_test(unsupported = test)]
+    fn test_find_depth_by_stem() {
+        let vfs = BrushVfs::create_test_vfs(vec![
+            PathBuf::from("images/foo/bar.png"),
+            PathBuf::from("depth/foo/bar.tiff"),
+            PathBuf::from("images/other.png"),
+        ]);
+        assert_eq!(
+            find_depth_path(&vfs, Path::new("images/foo/bar.png")),
+            Some(Path::new("depth/foo/bar.tiff"))
+        );
+        assert_eq!(find_depth_path(&vfs, Path::new("images/other.png")), None);
+
+        // A depth directory at the dataset root matches by stem alone.
+        let vfs = BrushVfs::create_test_vfs(vec![
+            PathBuf::from("images/view.png"),
+            PathBuf::from("depth/view.tiff"),
+        ]);
+        assert_eq!(
+            find_depth_path(&vfs, Path::new("images/view.png")),
+            Some(Path::new("depth/view.tiff"))
+        );
+
+        // The depth map itself is not an RGB image.
+        assert!(find_image_by_name(&vfs, "view.tiff").is_none());
     }
 
     #[wasm_bindgen_test(unsupported = test)]
