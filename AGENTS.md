@@ -34,4 +34,4 @@
 - 外观补偿加入均值约束和遮罩邻域修正后，曝光变化组的留出前景 PSNR 从 21.78 dB 变为 21.17 dB，轮廓外平均 alpha 从 0.01948 变为 0.02036。平衡曝光组的轮廓外平均 alpha 从 0.02022 降到 0.01981，留出前景 PSNR 从 21.77 dB 变为 20.85 dB。每 48 步 reset 的组合组执行了 split、三次 reset 和一次 checkpoint 恢复，留出前景 PSNR 为 17.12 dB。外观和 reset 作为可选项保留，真实采集场景质量待验证。
 - 原生 Metal CLI 在第 30 步写出组合 checkpoint，恢复训练到第 42 步，并在预定的第 32 阶段步触发 reset。格式、Clippy 和 87 项原生回归通过，手动单针 A/B 单独执行。
 - macOS 桌面在同一窗口显示场景 Camera Z 和无单位的相对逆深度，切换图像后 TIFF 深度范围随之更新。WASM 编译通过。Chrome 适配器的每阶段存储缓冲上限是 10，投影前向和反向内核分别需要 12 和 11，关闭新功能的 RGB 对照也触发了这一限制。浏览器运行验收需要单独适配渲染器绑定布局。
-- 合成场景生成器、对照脚本和本地日志位于 `target/issue3-acceptance/`。
+- 合成训练对照可从 [`crates/brush-bench-test/test_cases/issue3`](crates/brush-bench-test/test_cases/issue3/README.md) 重新生成并运行。生成的数据和日志放在 `target/`。
