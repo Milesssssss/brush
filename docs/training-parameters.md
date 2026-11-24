@@ -111,7 +111,7 @@ Fewer views and fewer SfM points mean less work per step and a smaller starting 
 
 ## Depth supervision
 
-Depth loss is disabled by default. Supply float32 TIFF sidecars from an external source, then set a positive depth loss weight.
+Depth loss is disabled by default. Supply float32 TIFF sidecars from an external source, then set a positive depth loss weight. The dataset loader still reads paired TIFFs at zero loss weight and counts them against the batch cache budget.
 
 | Flag | Default | What it does |
 | --- | --- | --- |

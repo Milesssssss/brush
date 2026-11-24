@@ -18,4 +18,6 @@ The generator uses the Python standard library. Both COLMAP variants share the s
 
 The runner writes one JSON row per case with held-out foreground PSNR, horizontal RGB gradient error, mean alpha outside the silhouette, coverage at alpha ≥ 0.25 and camera-Z MAE on covered pixels. The depth reference is the generator's metric TIFF for each held-out camera in every case. Compare depth MAE alongside coverage and use the two RGB runs to gauge variation.
 
+On Apple M5 with native Metal at `ca96f2e1`, the two RGB runs had held-out camera-Z MAE of 0.1363 and 0.1372. Metric and relative supervision had MAE of 0.0977 and 0.1151, respectively. Foreground coverage was 100% in all four runs, with foreground PSNR between 22.39 and 22.45 dB.
+
 To run a subset, pass case names after the fixture path, for example `target/issue7-depth baseline metric`. This test exercises sidecar loading and the training loss on known synthetic geometry. Gains from a learned depth prior on real captures, and the number of views needed for a target quality, require separate measurement.
