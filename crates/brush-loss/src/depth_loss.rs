@@ -112,14 +112,10 @@ pub fn relative_inverse_depth_loss(
 
     let weight_patches = depth_patches(weights);
     let image_weights = weight_patches.clone().reshape([1, -1]);
-    let (pred_local, pred_global, pred_std) =
-        normalized_depth(pred, &weight_patches, &image_weights);
+    let (pred_local, pred_global, _) = normalized_depth(pred, &weight_patches, &image_weights);
     let (target_local, target_global, target_std) =
         normalized_depth(target, &weight_patches, &image_weights);
-    let variable = pred_std
-        .greater_elem(0.0)
-        .bool_and(target_std.greater_elem(0.0));
-    let weights = weight_patches * variable.float();
+    let weights = weight_patches * target_std.greater_elem(0.0).float();
 
     0.1 * margin_l2(pred_local - target_local, weights.clone())
         + margin_l2(pred_global - target_global, weights)
@@ -148,10 +144,14 @@ fn normalized_depth(
     image_weights: &Tensor<2>,
 ) -> (Tensor<2>, Tensor<2>, Tensor<2>) {
     let patches = depth_patches(values);
-    let (_, image_std) = weighted_depth_stats(patches.clone().reshape([1, -1]), image_weights);
-    let (centered, patch_std) = weighted_depth_stats(patches, weight_patches);
-    let local_std = patch_std + image_std.clone() * 0.01;
-    let global_std = image_std.clone().detach() * 1.01;
+    let (_, image_std, pivot) =
+        weighted_depth_stats(patches.clone().reshape([1, -1]), image_weights);
+    let (centered, patch_std, _) = weighted_depth_stats(patches, weight_patches);
+    // A flat prediction still needs a gradient. Use the magnitude of its
+    // detached disparity so the gradient scales with changes in depth units.
+    let fallback = image_std.clone().equal_elem(0.0).float() * nonzero(pivot.abs());
+    let local_std = patch_std + image_std.clone() * 0.01 + fallback.clone();
+    let global_std = image_std.clone().detach() * 1.01 + fallback;
     (
         centered.clone() / nonzero(local_std),
         centered / nonzero(global_std),
@@ -159,11 +159,14 @@ fn normalized_depth(
     )
 }
 
-fn weighted_depth_stats(values: Tensor<2>, weights: &Tensor<2>) -> (Tensor<2>, Tensor<2>) {
+fn weighted_depth_stats(
+    values: Tensor<2>,
+    weights: &Tensor<2>,
+) -> (Tensor<2>, Tensor<2>, Tensor<2>) {
     // Center relative to a covered sample first. A flat patch then has exact
     // zero variance even with fractional weights and a rounded weighted mean.
     let pivot = values.clone().gather(1, weights.clone().argmax(1)).detach();
-    let values = values - pivot;
+    let values = values - pivot.clone();
     let count = nonzero(weights.clone().sum_dim(1));
     let mean = (values.clone() * weights.clone()).sum_dim(1) / count.clone();
     let centered = (values - mean).mask_fill(weights.clone().equal_elem(0.0), 0.0);
@@ -172,7 +175,7 @@ fn weighted_depth_stats(values: Tensor<2>, weights: &Tensor<2>) -> (Tensor<2>, T
     // at zero even if a later normalization denominator is regularized.
     let zero = var.clone().equal_elem(0.0);
     let std = var.mask_fill(zero.clone(), 1.0).sqrt().mask_fill(zero, 0.0);
-    (centered, std)
+    (centered, std, pivot)
 }
 
 fn margin_l2(error: Tensor<2>, weights: Tensor<2>) -> Tensor<1> {

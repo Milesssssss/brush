@@ -4,7 +4,10 @@ use std::path::Path;
 
 use brush_process::config::TrainStreamConfig;
 use brush_process::message::{ProcessMessage, TrainMessage};
-use brush_process::{DataSource, RunningProcess, burn_init_setup, create_process_with_device};
+use brush_process::{
+    DataSource, ProcessDevice, RunningProcess, burn_init_setup, create_process_with_device,
+};
+use tokio::sync::OnceCell;
 use tokio_stream::StreamExt;
 
 fn config(output: &Path) -> TrainStreamConfig {
@@ -21,7 +24,9 @@ fn config(output: &Path) -> TrainStreamConfig {
 
 async fn start(config: TrainStreamConfig) -> RunningProcess {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/test_dataset");
-    let device = burn_init_setup().await;
+    // WGPU registers the default device once per process, including on resume.
+    static DEVICE: OnceCell<ProcessDevice> = OnceCell::const_new();
+    let device = DEVICE.get_or_init(burn_init_setup).await.clone();
     create_process_with_device(
         DataSource::Path(path.to_str().unwrap().to_owned()),
         device,

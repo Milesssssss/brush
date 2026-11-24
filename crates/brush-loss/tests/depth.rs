@@ -271,6 +271,48 @@ async fn relative_depth_fits_affine_disparity_and_keeps_partial_patches() {
 }
 
 #[tokio::test]
+async fn relative_depth_moves_a_flat_prediction_toward_target_structure() {
+    let device = Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+    let depth = [2.0; 3];
+    let target = [3.0, 1.0, -1.0];
+    let (loss, grad) = relative_result(&device, &depth, &target, None).await;
+    assert!(
+        loss.is_finite() && loss > 0.5,
+        "flat prediction loss: {loss}"
+    );
+    assert!(
+        grad.iter().all(|g| g.is_finite()),
+        "flat prediction gradient: {grad:?}"
+    );
+    assert!(
+        grad[0] > 0.01 && grad[2] < -0.01,
+        "wrong depth directions: {grad:?}"
+    );
+
+    let moved: Vec<_> = depth.iter().zip(&grad).map(|(z, g)| z - 0.05 * g).collect();
+    let (moved_loss, _) = relative_result(&device, &moved, &target, None).await;
+    assert!(
+        moved_loss < loss,
+        "loss after the step: {moved_loss} vs {loss}"
+    );
+
+    let scaled_depth = depth.map(|z| z * 4.0);
+    let affine_target = target.map(|d| d * 2.0 + 7.0);
+    let (scaled_loss, scaled_grad) =
+        relative_result(&device, &scaled_depth, &affine_target, None).await;
+    assert!(
+        (loss - scaled_loss).abs() < 1e-5,
+        "scaled loss: {scaled_loss} vs {loss}"
+    );
+    assert!(
+        grad.iter()
+            .zip(scaled_grad)
+            .all(|(a, b)| (a - 4.0 * b).abs() < 1e-5),
+        "changing depth units must scale the gradient inversely"
+    );
+}
+
+#[tokio::test]
 async fn relative_depth_mask_controls_statistics_and_empty_loss() {
     let device = Device::from(brush_cube::test_helpers::test_device().await).autodiff();
     let depth = [1.0, 2.0, 4.0, 3.0, 1.0];

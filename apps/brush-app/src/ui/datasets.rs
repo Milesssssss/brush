@@ -1,5 +1,5 @@
 use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use brush_dataset::{
     Dataset,
@@ -151,9 +151,7 @@ impl PreviewLoader {
     }
 }
 
-#[derive(Clone)]
 struct DepthFrame {
-    path: PathBuf,
     tex: TexHandle,
     range: Option<(f32, f32)>,
 }
@@ -165,11 +163,48 @@ struct DepthJob {
     reply: oneshot::Sender<Option<DepthFrame>>,
 }
 
+enum DepthPreviewState {
+    Pending(oneshot::Receiver<Option<DepthFrame>>),
+    Ready(DepthFrame),
+    Failed,
+}
+
+#[derive(Default)]
+struct DepthPreviewSlot {
+    current: Option<(PathBuf, DepthPreviewState)>,
+}
+
+impl DepthPreviewSlot {
+    fn clear(&mut self) {
+        self.current = None;
+    }
+
+    fn request(
+        &mut self,
+        path: &Path,
+        start: impl FnOnce() -> oneshot::Receiver<Option<DepthFrame>>,
+    ) -> &DepthPreviewState {
+        if self.current.as_ref().is_none_or(|(key, _)| key != path) {
+            self.current = Some((path.to_owned(), DepthPreviewState::Pending(start())));
+        }
+        let (_, state) = self.current.as_mut().expect("a preview is selected");
+        if let DepthPreviewState::Pending(rx) = state {
+            match rx.try_recv() {
+                Ok(Some(frame)) => *state = DepthPreviewState::Ready(frame),
+                Ok(None) | Err(oneshot::error::TryRecvError::Closed) => {
+                    *state = DepthPreviewState::Failed;
+                }
+                Err(oneshot::error::TryRecvError::Empty) => {}
+            }
+        }
+        state
+    }
+}
+
 struct DepthPreviewLoader {
     jobs: async_channel::Sender<DepthJob>,
     _worker: Actor,
-    pending: Option<(PathBuf, oneshot::Receiver<Option<DepthFrame>>)>,
-    ready: Option<DepthFrame>,
+    preview: DepthPreviewSlot,
 }
 
 impl DepthPreviewLoader {
@@ -188,26 +223,16 @@ impl DepthPreviewLoader {
         Self {
             jobs,
             _worker: actor,
-            pending: None,
-            ready: None,
+            preview: DepthPreviewSlot::default(),
         }
     }
 
     fn clear(&mut self) {
-        self.pending = None;
-        self.ready = None;
+        self.preview.clear();
     }
 
-    fn request(&mut self, depth: &LoadDepth, ctx: &egui::Context, edge: u32) -> Option<DepthFrame> {
-        let path = depth.path().to_path_buf();
-        if self.ready.as_ref().is_some_and(|frame| frame.path == path) {
-            return self.ready.clone();
-        }
-        let pending_matches = self
-            .pending
-            .as_ref()
-            .is_some_and(|(pending, _)| pending == &path);
-        if !pending_matches {
+    fn request(&mut self, depth: &LoadDepth, ctx: &egui::Context, edge: u32) -> &DepthPreviewState {
+        self.preview.request(depth.path(), || {
             let (reply, rx) = oneshot::channel();
             let _ = self.jobs.try_send(DepthJob {
                 depth: depth.clone(),
@@ -215,20 +240,12 @@ impl DepthPreviewLoader {
                 ctx: ctx.clone(),
                 reply,
             });
-            self.pending = Some((path.clone(), rx));
-        }
-        if let Some((_, rx)) = &mut self.pending
-            && let Ok(frame) = rx.try_recv()
-        {
-            self.pending = None;
-            self.ready = frame;
-        }
-        self.ready.clone().filter(|frame| frame.path == path)
+            rx
+        })
     }
 }
 
 async fn load_depth_preview(depth: LoadDepth, ctx: egui::Context, edge: u32) -> Option<DepthFrame> {
-    let path = depth.path().to_path_buf();
     let (samples, width, height) = depth.load_values().await.ok()?;
     let long_edge = width.max(height).max(1);
     let (preview, preview_w, preview_h) = if long_edge > edge as usize {
@@ -246,12 +263,11 @@ async fn load_depth_preview(depth: LoadDepth, ctx: egui::Context, edge: u32) -> 
     let colored = colorize_depth(&preview, preview_w, preview_h, depth.mode());
     let image = egui::ColorImage::from_rgba_unmultiplied([preview_w, preview_h], &colored.rgba);
     let handle = ctx.load_texture(
-        path.to_string_lossy().into_owned(),
+        depth.path().to_string_lossy().into_owned(),
         image,
         TextureOptions::default(),
     );
     Some(DepthFrame {
-        path,
         tex: TexHandle {
             handle,
             has_alpha: true,
@@ -259,6 +275,17 @@ async fn load_depth_preview(depth: LoadDepth, ctx: egui::Context, edge: u32) -> 
         },
         range: colored.range,
     })
+}
+
+fn draw_depth_status(ui: &mut egui::Ui, message: &str) {
+    ui.centered_and_justified(|ui| {
+        ui.label(
+            egui::RichText::new(message)
+                .size(14.0)
+                .color(Color32::from_rgb(140, 140, 140))
+                .italics(),
+        );
+    });
 }
 
 pub struct DatasetPanel {
@@ -329,28 +356,22 @@ impl DatasetPanel {
             .rect_filled(full_rect, 0.0, Color32::from_gray(20));
 
         let Some(depth) = &view.depth else {
-            ui.centered_and_justified(|ui| {
-                ui.label(
-                    egui::RichText::new("This view has no depth map")
-                        .size(14.0)
-                        .color(Color32::from_rgb(140, 140, 140))
-                        .italics(),
-                );
-            });
+            self.depth_loader.clear();
+            draw_depth_status(ui, "This view has no depth map");
             return;
         };
 
         let edge = ((available.max_elem() * ui.ctx().pixels_per_point()).ceil() as u32).max(32);
-        let Some(frame) = self.depth_loader.request(depth, ui.ctx(), edge) else {
-            ui.centered_and_justified(|ui| {
-                ui.label(
-                    egui::RichText::new("Loading depth map")
-                        .size(14.0)
-                        .color(Color32::from_rgb(140, 140, 140))
-                        .italics(),
-                );
-            });
-            return;
+        let frame = match self.depth_loader.request(depth, ui.ctx(), edge) {
+            DepthPreviewState::Ready(frame) => frame,
+            DepthPreviewState::Pending(_) => {
+                draw_depth_status(ui, "Loading depth map");
+                return;
+            }
+            DepthPreviewState::Failed => {
+                draw_depth_status(ui, "Could not load depth map");
+                return;
+            }
         };
 
         let aspect = frame.tex.handle.aspect_ratio();
@@ -673,5 +694,80 @@ impl AppPane for DatasetPanel {
                 self.focus_picked(process);
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn depth_preview_failure_sticks_until_the_source_changes_or_clears() {
+        let mut slot = DepthPreviewSlot::default();
+        let first = Path::new("depth/first.tiff");
+        let second = Path::new("depth/second.tiff");
+        let no_reload = || panic!("repeated frames must not start another depth job");
+
+        let (reply, rx) = oneshot::channel();
+        assert!(matches!(
+            slot.request(first, || rx),
+            DepthPreviewState::Pending(_)
+        ));
+        assert!(matches!(
+            slot.request(first, no_reload),
+            DepthPreviewState::Pending(_)
+        ));
+        assert!(reply.send(None).is_ok(), "the failing load should complete");
+        for _ in 0..3 {
+            assert!(matches!(
+                slot.request(first, no_reload),
+                DepthPreviewState::Failed
+            ));
+        }
+
+        let (reply, rx) = oneshot::channel();
+        assert!(matches!(
+            slot.request(second, || rx),
+            DepthPreviewState::Pending(_)
+        ));
+        let ctx = egui::Context::default();
+        let handle = ctx.load_texture(
+            "depth preview test",
+            egui::ColorImage::filled([1, 1], Color32::WHITE),
+            TextureOptions::default(),
+        );
+        let frame = DepthFrame {
+            range: Some((1.0, 2.0)),
+            tex: TexHandle {
+                handle,
+                has_alpha: true,
+                train_size: (1, 1),
+            },
+        };
+        assert!(
+            reply.send(Some(frame)).is_ok(),
+            "the replacement load should complete"
+        );
+        assert!(
+            matches!(slot.request(second, no_reload), DepthPreviewState::Ready(frame) if frame.range == Some((1.0, 2.0)))
+        );
+
+        let (reply, rx) = oneshot::channel();
+        assert!(matches!(
+            slot.request(first, || rx),
+            DepthPreviewState::Pending(_)
+        ));
+        drop(reply);
+        assert!(matches!(
+            slot.request(first, no_reload),
+            DepthPreviewState::Failed
+        ));
+
+        slot.clear();
+        let (_reply, rx) = oneshot::channel();
+        assert!(matches!(
+            slot.request(first, || rx),
+            DepthPreviewState::Pending(_)
+        ));
     }
 }
