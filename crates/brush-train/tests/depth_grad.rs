@@ -108,7 +108,7 @@ async fn values<const D: usize>(tensor: Tensor<D>) -> Vec<f32> {
 }
 
 fn assert_close(a: &[f32], b: &[f32], tolerance: f32) {
-    assert_eq!(a.len(), b.len());
+    assert_eq!(a.len(), b.len(), "tensor readbacks differ in length");
     for (i, (&a, &b)) in a.iter().zip(b).enumerate() {
         assert!((a - b).abs() <= tolerance, "index {i}: {a} vs {b}");
     }
@@ -293,7 +293,7 @@ async fn trainer_masks_depth_and_ignores_invalid_targets_in_both_modes() {
     ];
     let splats = splats_at(camera, &points, &device);
     let mut mask = vec![255; PIXELS];
-    for row in mask.chunks_exact_mut(SIDE) {
+    for row in mask.as_chunks_mut::<SIDE>().0 {
         row[17..].fill(0);
     }
     for mode in [DepthMode::Metric, DepthMode::RelativeInverse] {

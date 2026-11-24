@@ -8,7 +8,8 @@ use serde::{Deserialize, Serialize};
 use crate::adam_scaled::{AdamScaled, AdamState, MomentumState};
 
 const LEARNING_RATE: f64 = 0.01;
-pub(crate) const IDENTITY_WEIGHT: f32 = 0.01;
+const IDENTITY_WEIGHT: f32 = 0.01;
+const MEAN_IDENTITY_WEIGHT: f32 = 1.0;
 
 #[derive(Serialize, Deserialize)]
 pub(crate) struct AppearanceViews {
@@ -67,6 +68,16 @@ impl Appearance {
 
     pub fn for_training(&self, index: usize) -> Tensor<2> {
         Tensor::from_inner(affine_row(&self.params, index)).require_grad()
+    }
+
+    pub fn regularization(&self, delta: &Tensor<2>) -> Tensor<1> {
+        let mean = self.params.clone().mean_dim(0).reshape([4, 3]);
+        // One sampled view represents all views for the mean penalty. The
+        // zero-valued residual scales the active row's gradient by the view count.
+        let mean =
+            Tensor::from_inner(mean) + (delta.clone() - Tensor::from_inner(delta.clone().inner()));
+        delta.clone().powi_scalar(2).mean() * IDENTITY_WEIGHT
+            + mean.powi_scalar(2).mean() * MEAN_IDENTITY_WEIGHT
     }
 
     pub fn for_view(&self, path: &Path) -> Option<Tensor<2>> {

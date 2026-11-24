@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use crate::{
     adam_scaled::{AdamScaled, AdamState},
-    appearance::{Appearance, IDENTITY_WEIGHT, correct_image},
+    appearance::{Appearance, correct_image},
     config::TrainConfig,
     msg::{RefineStats, TrainStepStats},
     multinomial::multinomial_sample,
@@ -521,8 +521,8 @@ impl SplatTrainer {
                 None => pred_for_loss,
             };
             let mut loss = image_loss(pred_for_loss.clone(), gt_packed.clone(), cfg);
-            if let Some(delta) = &appearance_delta {
-                loss = loss + delta.clone().powi_scalar(2).mean() * IDENTITY_WEIGHT;
+            if let (Some(appearance), Some(delta)) = (&self.appearance, &appearance_delta) {
+                loss = loss + appearance.regularization(delta);
             }
 
             // LPIPS still needs an f32 RGB tensor for VGG. Materialising it

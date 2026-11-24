@@ -111,6 +111,24 @@ async fn affine_preserves_alpha_and_the_synthetic_background() {
 }
 
 #[wasm_bindgen_test(unsupported = tokio::test)]
+async fn mean_affine_anchor_corrects_the_sampled_gradient_for_view_count() {
+    let device = brush_cube::test_helpers::test_device().await.into();
+    let mut appearance = Appearance::new(["a", "b", "c"].map(PathBuf::from).to_vec(), &device);
+    appearance.params = Tensor::from_floats(
+        [0.3, -0.1, 0.4].map(|gain| [[gain, 0.0, 0.0], [0.0; 3], [0.0; 3], [0.0; 3]]),
+        &device,
+    );
+    let delta = appearance.for_training(0);
+    let loss = appearance.regularization(&delta);
+    let expected_loss = (0.09 * IDENTITY_WEIGHT + 0.04 * MEAN_IDENTITY_WEIGHT) / 12.0;
+    assert_close(&values(loss.clone()).await, &[expected_loss]);
+    let grad = values(delta.grad(&loss.backward()).unwrap()).await;
+    let expected_gradient = (0.6 * IDENTITY_WEIGHT + 0.4 * MEAN_IDENTITY_WEIGHT) / 12.0;
+    assert_close(&grad[..1], &[expected_gradient]);
+    assert_close(&grad[1..], &[0.0; 11]);
+}
+
+#[wasm_bindgen_test(unsupported = tokio::test)]
 async fn trainer_learns_an_exposure_change_and_resumes_by_image_path() {
     let device = Device::from(brush_cube::test_helpers::test_device().await).autodiff();
     let inner = device.clone().inner();
@@ -127,7 +145,9 @@ async fn trainer_learns_an_exposure_change_and_resumes_by_image_path() {
     assert!(aux.num_visible > 0, "the scene fixture must render");
     let rgb: Vec<u8> = values(canonical)
         .await
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .flat_map(|pixel| {
             [1.45, 0.8, 1.15]
                 .into_iter()
@@ -186,16 +206,7 @@ async fn trainer_learns_an_exposure_change_and_resumes_by_image_path() {
         .unwrap();
     let loaded = checkpoint_from_bytes(&blob, &config, &inner, 42).unwrap();
     let mut resumed = loaded.trainer;
-    let new_view = PathBuf::from("images/new.png");
-    resumed.set_appearance_views(vec![other, frame.clone(), new_view.clone()], &device);
-    assert!(
-        resumed.appearance_for_view(&new_view).is_none(),
-        "unknown path starts at identity"
-    );
-    assert_close(
-        &values(affine_row(&resumed.appearance.as_ref().unwrap().params, 2)).await,
-        &[0.0; 12],
-    );
+    resumed.set_appearance_views(vec![other.clone(), frame.clone()], &device);
     assert_close(
         &values(resumed.appearance_for_view(&frame).unwrap()).await,
         &values(trainer.appearance_for_view(&frame).unwrap()).await,
@@ -208,6 +219,17 @@ async fn trainer_learns_an_exposure_change_and_resumes_by_image_path() {
     assert_close(
         &values(resumed.appearance_for_view(&frame).unwrap()).await,
         &values(trainer.appearance_for_view(&frame).unwrap()).await,
+    );
+
+    let new_view = PathBuf::from("images/new.png");
+    resumed.set_appearance_views(vec![other, frame, new_view.clone()], &device);
+    assert!(
+        resumed.appearance_for_view(&new_view).is_none(),
+        "unknown path starts at identity"
+    );
+    assert_close(
+        &values(affine_row(&resumed.appearance.as_ref().unwrap().params, 2)).await,
+        &[0.0; 12],
     );
 }
 

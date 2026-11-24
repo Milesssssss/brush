@@ -131,7 +131,7 @@ Touch these only when diagnosing divergence or known scene quirks. Prefer resolu
 
 ## Per-image appearance compensation
 
-Enable `--appearance-compensation` when images have different exposure or white balance. Brush learns an RGB affine for each training image with a penalty for moving away from the identity. The transform acts on foreground color and preserves opacity and the synthetic background.
+Enable `--appearance-compensation` when images have different exposure or white balance. Brush learns an RGB affine for each training image and regularizes the individual transforms and their mean toward the identity. The transform acts on foreground color and preserves opacity and the synthetic background.
 
 Evaluation applies the learned correction to matching training images and reports those scores separately when held-out views are available. Held-out images and the free camera use the scene's canonical color. Use `--checkpoint-every` and resume with `--appearance-compensation` to restore the corrections and their optimizer by dataset-relative image path. PLY exports contain the canonical splat colors and remain independently viewable.
 

@@ -62,9 +62,12 @@ fn reset_runs_after_the_first_refine_when_resuming() {
                 }
             }
             let before = effective_opacities(&run).await;
-            assert!(before.iter().any(|alpha| *alpha > 0.1));
+            assert!(
+                before.iter().any(|alpha| *alpha > 0.1),
+                "the fixture must have opacity to reset"
+            );
             let checkpoint = dir.path().join("checkpoint.safetensors");
-            assert!(checkpoint.is_file());
+            assert!(checkpoint.is_file(), "step five must save a checkpoint");
             drop(run);
 
             config.process_config.resume = Some(checkpoint.to_str().unwrap().to_owned());
@@ -74,34 +77,53 @@ fn reset_runs_after_the_first_refine_when_resuming() {
             while let Some(event) = resumed.stream.next().await {
                 match event.unwrap() {
                     ProcessMessage::DoneLoading => {
-                        assert_eq!(effective_opacities(&resumed).await, before);
+                        assert_eq!(
+                            effective_opacities(&resumed).await,
+                            before,
+                            "loading the checkpoint must restore the pre-reset opacity"
+                        );
                         checkpoint_loaded = true;
                     }
                     ProcessMessage::TrainMessage(TrainMessage::RefineStep {
                         iter,
                         cur_splat_count,
                     }) => {
-                        assert!(checkpoint_loaded);
-                        assert_eq!(iter, 6);
-                        assert!(cur_splat_count as usize > before.len());
-                        assert!(resumed.splat_view.latest().unwrap().min_scale.is_some());
+                        assert!(checkpoint_loaded, "refine must follow checkpoint load");
+                        assert_eq!(iter, 6, "resume must split at the first scheduled refine");
+                        assert!(
+                            cur_splat_count as usize > before.len(),
+                            "the fixture must actually generate split children"
+                        );
+                        assert!(
+                            resumed.splat_view.latest().unwrap().min_scale.is_some(),
+                            "the reset must run with the scale floor attached"
+                        );
                         let effective = effective_opacities(&resumed).await;
-                        assert_eq!(effective.len(), cur_splat_count as usize);
+                        assert_eq!(
+                            effective.len(),
+                            cur_splat_count as usize,
+                            "the reset must apply to the child rows"
+                        );
                         assert!(
                             effective
                                 .iter()
-                                .all(|alpha| alpha.is_finite() && *alpha <= 0.01001)
+                                .all(|alpha| alpha.is_finite() && *alpha <= 0.01001),
+                            "effective opacity must stay within the reset cap"
                         );
-                        assert!(effective.iter().any(|alpha| *alpha >= 0.00999));
+                        assert!(
+                            effective.iter().any(|alpha| *alpha >= 0.00999),
+                            "the cap must keep some visible splats"
+                        );
                         reset_observed = true;
                     }
                     ProcessMessage::TrainMessage(TrainMessage::TrainStep { iter: 10, .. }) => {
-                        assert!(reset_observed);
+                        assert!(reset_observed, "resumed training must reach the reset");
                         assert!(
                             effective_opacities(&resumed)
                                 .await
                                 .iter()
-                                .all(|alpha| alpha.is_finite())
+                                .all(|alpha| alpha.is_finite()),
+                            "steps after the reset must keep finite opacities"
                         );
                         return;
                     }
@@ -131,7 +153,10 @@ fn reset_does_not_fire_past_the_phase_cutoff() {
                     ProcessMessage::TrainMessage(TrainMessage::DoneTraining)
                 ) {
                     let effective = effective_opacities(&run).await;
-                    assert!(effective.iter().any(|alpha| *alpha > 0.05));
+                    assert!(
+                        effective.iter().any(|alpha| *alpha > 0.05),
+                        "the final iteration must leave opacities above the reset cap"
+                    );
                     return;
                 }
             }
