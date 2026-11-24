@@ -48,9 +48,17 @@ pub fn alpha_cutoff_weight_deriv(alpha: f32) -> f32 {
 
 /// `f32` lanes per projected splat. Layout matches `Splat`:
 ///   0:xy_x, 1:xy_y, 2:conic_x, 3:conic_y, 4:conic_z, 5:color_a,
-///   6:color_r, 7:color_g, 8:color_b.
-pub const PROJECTED_LANES: u32 = 9;
+///   6:color_r, 7:color_g, 8:color_b, 9:depth.
+///
+/// The depth lane is written for every splat. Colour-only rasterization
+/// does not read it, so RGB results stay the same.
+pub const PROJECTED_LANES: u32 = 10;
 pub const PROJECTED_LANES_USIZE: usize = PROJECTED_LANES as usize;
+
+/// Lanes in the rasterize-backward gradient, indexed by `compact_gid`:
+/// xy(2) + conic(3) + rgb(3) + alpha + refine + depth.
+/// Depth is zero unless that render accumulated a depth channel.
+pub const RASTER_GRAD_LANES: u32 = 11;
 
 #[cube]
 pub fn compact_bits_16(v: u32) -> u32 {
@@ -275,6 +283,7 @@ pub fn read_projected_splat(projected: &Tensor<f32>, idx: u32) -> Splat {
         color_r: projected[b + 6],
         color_g: projected[b + 7],
         color_b: projected[b + 8],
+        depth: projected[b + 9],
     }
 }
 
@@ -290,6 +299,7 @@ pub fn write_projected_splat(projected: &mut Tensor<f32>, idx: u32, splat: Splat
     projected[b + 6] = splat.color_r;
     projected[b + 7] = splat.color_g;
     projected[b + 8] = splat.color_b;
+    projected[b + 9] = splat.depth;
 }
 
 /// View-space transform of a world-space mean using the project uniforms'

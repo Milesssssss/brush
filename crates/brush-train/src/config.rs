@@ -119,6 +119,12 @@ pub struct TrainConfig {
     #[arg(long, help_heading = "Refine options", default_value = "0.0")]
     pub lpips_loss_weight: f32,
 
+    /// Weight of depth supervision with the selected dataset depth mode.
+    /// `0` (the default) uses the four-channel color render.
+    #[arg(long, help_heading = "Training options", default_value = "0.0")]
+    #[serde(default)]
+    pub depth_loss_weight: f32,
+
     /// Base background color (R,G,B) used during training.
     #[arg(
         long,

@@ -109,9 +109,25 @@ Fewer views and fewer SfM points mean less work per step and a smaller starting 
 - Use `--subsample-frames 2` or `4` to scout settings
 - `--subsample-points` helps when the init PLY is huge (also see `--max-splats` subsampling at load)
 
+## Depth supervision
+
+Depth loss is disabled by default. Supply float32 TIFF sidecars from an external source, then set a positive depth loss weight.
+
+| Flag | Default | What it does |
+| --- | --- | --- |
+| `--depth-loss-weight` | `0` | Weight of depth supervision against COLMAP `depth/*.tiff`. `0` keeps the four-channel color renderer. |
+| `--depth-mode` | `metric` | `metric` compares inverse camera Z. `relative-inverse` uses masked patch and image-scale normalization on unitless, near-high inverse depth. |
+| `--estimate-metric-scale` | off | One global scale from those depth maps and projected landmarks. Skipped when no depth maps are present. `--units-per-meter` still applies afterwards. |
+
+Match each single-channel float32 TIFF to its RGB stem (`images/frame.png` → `depth/frame.tiff`). Metric samples must be finite and positive. `--estimate-metric-scale` uses the metric map's own resolution and scales whichever initializer is used, including an overriding PLY. Values and camera positions are divided by `--units-per-meter` before the metric loss.
+
+Relative inverse depth accepts finite signed values and uses non-finite values to mark invalid pixels. Leave the TIFF values in their original unitless scale. The loss uses 11×11 patches, a normalized residual margin of 0.2, and local and image-scale terms weighted 0.1 and 1.0 before applying `--depth-loss-weight`. The source alpha mask weights the statistics and the residuals. Relative-inverse mode excludes pixels with no rendered depth and requires metric scale estimation to be off.
+
+The [synthetic depth comparison](../crates/brush-bench-test/test_cases/issue7/README.md) uses the same initialization and view split for RGB, metric depth, and relative depth. To measure the benefit of an offline predictor on captures, keep the same SfM initialization and real held-out images across the three runs and evaluate each training-view count separately.
+
 ## Learning rates and loss (usually leave alone)
 
-`--lr-mean`, `--lr-mean-end`, `--lr-coeffs-dc`, `--lr-opac`, `--lr-scale`, `--lr-rotation`, `--ssim-weight`, and related flags match common Gaussian-splatting defaults.
+`--lr-mean`, `--lr-mean-end`, `--lr-coeffs-dc`, `--lr-opac`, `--lr-scale`, `--lr-rotation`, `--ssim-weight`, and related flags match common Gaussian-splatting defaults. `--depth-loss-weight` stays `0` unless the scene has depth maps you want to supervise with.
 
 Touch these only when diagnosing divergence or known scene quirks. Prefer resolution, growth, and iteration budget for normal tuning.
 

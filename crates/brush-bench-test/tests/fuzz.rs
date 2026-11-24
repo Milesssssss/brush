@@ -188,6 +188,7 @@ async fn render_raw(
         cube_tensor(device, [1], &[0.0]),
         cube_tensor(device, [1], &[0.0]),
         mode,
+        brush_render::gaussian_splats::RasterizationMode::Rgba,
         glam::Vec3::ZERO,
         brush_render::gaussian_splats::RasterPass::Forward,
     )

@@ -21,6 +21,24 @@ pub enum SplatRenderMode {
     Mip,
 }
 
+/// Extra channels the rasterizer writes on the float path.
+///
+/// [`Self::Rgba`] is the default and matches a colour-only render. Depth is
+/// opt-in so training that does not ask for it keeps the 4-channel image.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Default)]
+pub enum RasterizationMode {
+    #[default]
+    Rgba,
+    /// RGBA plus the alpha-weighted depth sum in channel 4.
+    RgbaAndDepth,
+}
+
+impl RasterizationMode {
+    pub const fn render_depth(self) -> bool {
+        matches!(self, Self::RgbaAndDepth)
+    }
+}
+
 /// Forward/backward rasterizer mode. Replaces the old `bwd_info: bool` so the
 /// test-only smooth-cutoff variant rides along on the same enum that already
 /// switches in/out the backward bookkeeping.
@@ -403,6 +421,51 @@ pub async fn render_splats(
     splat_scale: Option<f32>,
     texture_mode: TextureMode,
 ) -> (Tensor<3>, RenderAux) {
+    render_splats_inner(
+        splats,
+        camera,
+        img_size,
+        background,
+        splat_scale,
+        texture_mode,
+        RasterizationMode::Rgba,
+    )
+    .await
+}
+
+/// Render RGBA plus the alpha-weighted depth sum (channel 4).
+///
+/// Always uses the float image path. Expected depth is `channel4 / channel3`;
+/// the viewer detaches nothing because it does not differentiate, and training
+/// detaches the alpha denominator in the loss.
+pub async fn render_splats_depth(
+    splats: Splats,
+    camera: &Camera,
+    img_size: glam::UVec2,
+    background: Vec3,
+    splat_scale: Option<f32>,
+) -> (Tensor<3>, RenderAux) {
+    render_splats_inner(
+        splats,
+        camera,
+        img_size,
+        background,
+        splat_scale,
+        TextureMode::Float,
+        RasterizationMode::RgbaAndDepth,
+    )
+    .await
+}
+
+async fn render_splats_inner(
+    splats: Splats,
+    camera: &Camera,
+    img_size: glam::UVec2,
+    background: Vec3,
+    splat_scale: Option<f32>,
+    texture_mode: TextureMode,
+    raster_mode: RasterizationMode,
+) -> (Tensor<3>, RenderAux) {
     splats.clone().validate_values().await;
 
     // The 3D-filter floor is part of the splat's definition, so eval/viewer
@@ -449,6 +512,7 @@ pub async fn render_splats(
         Tensor::<1>::zeros([1], &render_device).into_dispatch(),
         Tensor::<1>::zeros([1], &render_device).into_dispatch(),
         render_mode,
+        raster_mode,
         background,
         pass,
     )

@@ -1,4 +1,5 @@
 use crate::gaussian_splats::SplatRenderMode;
+use crate::kernels::helpers::RASTER_GRAD_LANES;
 use crate::kernels::types::RasterizeUniformsLaunch;
 use crate::sh::sh_coeffs_for_degree;
 use brush_cube::create_tensor;
@@ -29,6 +30,7 @@ impl SplatBwdOps for CubeBackend {
         img_size: glam::UVec2,
         v_output: FloatTensor<Self>,
         smooth_cutoff: bool,
+        render_depth: bool,
     ) -> FloatTensor<Self> {
         let _span = tracing::trace_span!("rasterize_bwd").entered();
 
@@ -37,8 +39,13 @@ impl SplatBwdOps for CubeBackend {
         let num_visible = projected_splats.shape()[0];
         let client = projected_splats.client.clone();
 
-        // Sparse [num_visible, 10] indexed by compact_gid.
-        let v_combined = Self::float_zeros([num_visible, 10].into(), &device, FloatDType::F32);
+        // Sparse [num_visible, RASTER_GRAD_LANES] indexed by compact_gid.
+        // The last lane is the depth gradient and stays zero for colour renders.
+        let v_combined = Self::float_zeros(
+            [num_visible, RASTER_GRAD_LANES as usize].into(),
+            &device,
+            FloatDType::F32,
+        );
 
         let tile_bounds = uvec2(
             img_size.x.div_ceil(crate::shaders::helpers::TILE_WIDTH),
@@ -78,6 +85,7 @@ impl SplatBwdOps for CubeBackend {
                     v_combined.clone().into_tensor_arg(),
                     uniforms,
                     smooth_cutoff,
+                    render_depth,
                 );
             } else {
                 rasterize_backwards_kernel::launch::<CasAtomicAdd>(
@@ -92,6 +100,7 @@ impl SplatBwdOps for CubeBackend {
                     v_combined.clone().into_tensor_arg(),
                     uniforms,
                     smooth_cutoff,
+                    render_depth,
                 );
             }
         });

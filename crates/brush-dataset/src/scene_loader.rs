@@ -7,7 +7,7 @@ use tokio::sync::{Mutex, mpsc};
 
 use crate::{
     config::LoadDatasetConfig,
-    scene::{Scene, SceneBatch, view_to_packed_data},
+    scene::{DepthBatch, Scene, SceneBatch, view_to_packed_data},
 };
 
 /// Shared cache of GPU-ready scene batches. Each slot holds at most one
@@ -16,7 +16,7 @@ use crate::{
 ///
 /// Caching the packed batch (instead of the decoded `DynamicImage`) skips
 /// the per-hit decode → premultiply → repack work. Cached buffers are put
-/// behind a refcount first (see `share_packed`), so a hit doesn't copy the
+/// behind a refcount first (see `share_tensor_data`), so a hit doesn't copy the
 /// pixels either: it hands out a view of the same allocation.
 struct BatchCache {
     slots: Vec<Option<Arc<SceneBatch>>>,
@@ -44,14 +44,14 @@ impl BatchCache {
     /// Tracks exact bytes: rounding to whole MB let sub-MB images slip in
     /// for free and bypass the budget entirely.
     fn admits(&self, index: usize, batch: &SceneBatch) -> bool {
-        self.slots[index].is_none() && self.used_bytes + batch.packed_bytes() < self.budget_bytes
+        self.slots[index].is_none() && self.used_bytes + batch.resident_bytes() < self.budget_bytes
     }
 
     fn insert(&mut self, index: usize, batch: Arc<SceneBatch>) {
         if !self.admits(index, &batch) {
             return;
         }
-        self.used_bytes += batch.packed_bytes();
+        self.used_bytes += batch.resident_bytes();
         self.slots[index] = Some(batch);
     }
 }
@@ -148,10 +148,26 @@ async fn run_loader(
                 .await
                 .expect("Scene loader failed to load an image");
             let (img_packed, has_alpha) = view_to_packed_data(raw, view.image.alpha_mode());
+            let [height, width] = [img_packed.shape()[0], img_packed.shape()[1]];
+            let depth = if let Some(load_depth) = &view.depth {
+                match load_depth.load_resized(height, width).await {
+                    Ok(data) => Some(DepthBatch {
+                        mode: load_depth.mode(),
+                        data,
+                    }),
+                    Err(err) => {
+                        log::warn!("Skipping depth map {}: {err}", load_depth.path().display());
+                        None
+                    }
+                }
+            } else {
+                None
+            };
             let mut batch = SceneBatch {
                 img_packed,
                 has_alpha,
                 alpha_mode: view.image.alpha_mode(),
+                depth,
                 camera: view.camera,
             };
 
@@ -159,7 +175,11 @@ async fn run_loader(
             if cache.admits(index, &batch) {
                 // Share the pixels before caching: this hand-off and every
                 // later hit then costs a refcount instead of a full copy.
-                batch.img_packed = share_packed(batch.img_packed);
+                batch.img_packed = share_tensor_data(batch.img_packed);
+                batch.depth = batch.depth.map(|depth| DepthBatch {
+                    data: share_tensor_data(depth.data),
+                    ..depth
+                });
                 cache.insert(index, Arc::new(batch.clone()));
             }
             batch
@@ -175,7 +195,7 @@ async fn run_loader(
 /// Move the packed pixels behind a refcount, so cloning the batch out of the
 /// cache doesn't copy them. Uploading to the GPU is unaffected: that copies
 /// into a staging buffer either way.
-fn share_packed(data: TensorData) -> TensorData {
+fn share_tensor_data(data: TensorData) -> TensorData {
     let (bytes, shape, dtype) = data.into_parts();
     TensorData::from_bytes(bytes.shared(), shape, dtype)
 }

@@ -1,9 +1,11 @@
+use crate::config::DepthMode;
 use brush_render::{AlphaMode, bounding_box::BoundingBox, camera::Camera};
 use burn::tensor::TensorData;
 use glam::{Affine3A, Vec3, vec3};
 use image::DynamicImage;
 use std::sync::Arc;
 
+pub use crate::load_depth::LoadDepth;
 pub use crate::load_image::LoadImage;
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -18,6 +20,8 @@ pub struct SceneView {
     pub image: LoadImage,
     pub camera: Camera,
     pub image_size: glam::UVec2,
+    /// Optional float32 depth map matched to this view.
+    pub depth: Option<LoadDepth>,
 }
 
 // Encapsulates a multi-view scene including cameras and the splats.
@@ -66,6 +70,7 @@ impl Scene {
                 image: v.image.with_scale(scale),
                 camera: v.camera,
                 image_size: v.image_size,
+                depth: v.depth,
             })
             .collect();
         Self::new(views)
@@ -138,6 +143,13 @@ fn pack_rgba(img: &image::RgbaImage, premultiply: bool) -> Vec<i32> {
 }
 
 #[derive(Clone, Debug)]
+pub struct DepthBatch {
+    pub mode: DepthMode,
+    /// `[H, W]` float32 depths in the selected convention.
+    pub data: TensorData,
+}
+
+#[derive(Clone, Debug)]
 pub struct SceneBatch {
     /// `[H, W]` u32, each entry packs `[r g b a]` u8.
     pub img_packed: TensorData,
@@ -145,6 +157,7 @@ pub struct SceneBatch {
     /// should consume (mask weight, alpha-matching loss, bg compositing).
     pub has_alpha: bool,
     pub alpha_mode: AlphaMode,
+    pub depth: Option<DepthBatch>,
     pub camera: Camera,
 }
 
@@ -156,6 +169,16 @@ impl SceneBatch {
             .len()
             .try_into()
             .expect("shouldn't exceed ~18 Exabytes...")
+    }
+
+    /// Image bytes plus the optional depth map. The frame cache uses this so
+    /// depth maps count against the same budget as the packed images.
+    pub fn resident_bytes(&self) -> u64 {
+        let depth = self
+            .depth
+            .as_ref()
+            .map_or(0, |d| d.data.as_bytes().len() as u64);
+        self.packed_bytes().saturating_add(depth)
     }
 
     pub fn img_size(&self) -> [usize; 2] {

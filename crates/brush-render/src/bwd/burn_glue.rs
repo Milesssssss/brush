@@ -50,11 +50,12 @@ mod bwd_ops {
 
     #[burn::backend::backend_extension(Fusion)]
     pub(crate) trait SplatBwdOps: Backend {
-        /// Returns sparse `v_combined` `[num_visible, 10]` indexed by
-        /// `compact_gid`: eight projected-splat gradients, then the raw opacity
-        /// gradient and the refinement weight.
+        /// Returns sparse `v_combined` `[num_visible, 11]` indexed by
+        /// `compact_gid`: projected xy, conic, rgb, raw opacity, refinement
+        /// weight, then the view-space depth gradient. The depth lane stays
+        /// zero for colour-only renders.
         #[allow(clippy::too_many_arguments)]
-        #[fusion(dtype = v_output, shape = Shape::new([projected_splats[0], 10]))]
+        #[fusion(dtype = v_output, shape = Shape::new([projected_splats[0], 11]))]
         fn rasterize_bwd(
             out_img: FloatTensor<Self>,
             projected_splats: FloatTensor<Self>,
@@ -64,6 +65,7 @@ mod bwd_ops {
             img_size: glam::UVec2,
             v_output: FloatTensor<Self>,
             smooth_cutoff: bool,
+            render_depth: bool,
         ) -> FloatTensor<Self>;
 
         /// Writes a zero row, then one row per visible splat in `compact_gid`
@@ -131,6 +133,7 @@ struct GaussianBackwardState<B: Backend> {
 
     render_mode: SplatRenderMode,
     pass: crate::gaussian_splats::RasterPass,
+    raster_mode: crate::gaussian_splats::RasterizationMode,
     background: Vec3,
     img_size: glam::UVec2,
 }
@@ -174,6 +177,7 @@ impl<B: Backend + SplatBwdOps> Backward<B, NUM_BWD_ARGS> for RenderBackwards {
             state.img_size,
             v_output,
             state.pass.smooth_cutoff(),
+            state.raster_mode.render_depth(),
         );
 
         let splat_grads = B::project_bwd(
@@ -258,12 +262,13 @@ pub async fn render_splats(
     img_size: glam::UVec2,
     background: Vec3,
 ) -> SplatOutputDiff {
-    render_splats_with_pass(
+    render_splats_with_mode(
         splats,
         camera,
         img_size,
         background,
         crate::gaussian_splats::RasterPass::Backward,
+        crate::gaussian_splats::RasterizationMode::Rgba,
     )
     .await
 }
@@ -277,6 +282,27 @@ pub async fn render_splats_with_pass(
     img_size: glam::UVec2,
     background: Vec3,
     pass: crate::gaussian_splats::RasterPass,
+) -> SplatOutputDiff {
+    render_splats_with_mode(
+        splats,
+        camera,
+        img_size,
+        background,
+        pass,
+        crate::gaussian_splats::RasterizationMode::Rgba,
+    )
+    .await
+}
+
+/// Like [`render_splats_with_pass`], also choosing whether to accumulate depth.
+#[allow(clippy::too_many_arguments)]
+pub async fn render_splats_with_mode(
+    splats: Splats,
+    camera: &Camera,
+    img_size: glam::UVec2,
+    background: Vec3,
+    pass: crate::gaussian_splats::RasterPass,
+    raster_mode: crate::gaussian_splats::RasterizationMode,
 ) -> SplatOutputDiff {
     splats.clone().validate_values().await;
 
@@ -317,6 +343,7 @@ pub async fn render_splats_with_pass(
         refine_weight_holder.clone().into_dispatch(),
         coeffs_grad_sq_holder.clone().into_dispatch(),
         render_mode,
+        raster_mode,
         background,
         pass,
     )
@@ -347,6 +374,7 @@ impl<B: Backend + SplatOps + SplatBwdOps, C: CheckpointStrategy> SplatOps for Au
         refine_weight: FloatTensor<Self>,
         coeffs_grad_sq: FloatTensor<Self>,
         render_mode: SplatRenderMode,
+        raster_mode: crate::gaussian_splats::RasterizationMode,
         background: Vec3,
         pass: crate::gaussian_splats::RasterPass,
     ) -> crate::RenderOutput<Self> {
@@ -378,6 +406,7 @@ impl<B: Backend + SplatOps + SplatBwdOps, C: CheckpointStrategy> SplatOps for Au
             refine_weight.into_primitive(),
             coeffs_grad_sq.into_primitive(),
             render_mode,
+            raster_mode,
             background,
             pass,
         )
@@ -400,6 +429,7 @@ impl<B: Backend + SplatOps + SplatBwdOps, C: CheckpointStrategy> SplatOps for Au
                     compact_gid_from_isect: output.compact_gid_from_isect.clone(),
                     render_mode,
                     pass,
+                    raster_mode,
                     global_from_compact_gid: output.global_from_compact_gid.clone(),
                     compact_from_global: output.compact_from_global.clone(),
                     background,

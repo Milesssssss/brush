@@ -6,8 +6,8 @@ use camera::Camera;
 use clap::ValueEnum;
 use glam::Vec3;
 
-use crate::gaussian_splats::SplatRenderMode;
-pub use crate::gaussian_splats::{Splats, TextureMode, render_splats};
+use crate::gaussian_splats::{RasterizationMode, SplatRenderMode};
+pub use crate::gaussian_splats::{Splats, TextureMode, render_splats, render_splats_depth};
 pub use crate::render_aux::{RenderAux, RenderAuxInner, RenderOutput};
 
 pub mod burn_glue;
@@ -42,12 +42,11 @@ pub(crate) use backend_kind;
 ///
 /// A single call performs: cull → readback → rasterize.
 ///
-/// `#[backend_extension(Wgpu)]` generates `impl SplatOps for Dispatch`, which
+/// `#[backend_extension]` generates `impl SplatOps for Dispatch`, which
 /// unwraps the type-erased `Tensor<D>` dispatch primitives to the concrete
-/// Wgpu backend, calls the hand-written `impl SplatOps for Wgpu`, and re-wraps
-/// the `RenderOutput` via its `ExtensionType` derive. Only the non-autodiff
-/// arm is generated: the differentiable path is a hand-rolled `Backward` in
-/// `brush-render-bwd` and never dispatches `render` through `Autodiff`.
+/// cube backend, calls the hand-written `impl SplatOps for CubeBackend`, and
+/// re-wraps the `RenderOutput` via its `ExtensionType` derive. The
+/// differentiable path is the hand-rolled backward in `bwd`.
 #[burn::backend::backend_extension(Cube, Autodiff)]
 pub trait SplatOps: Backend {
     /// Render gaussian splats to an image.
@@ -81,6 +80,7 @@ pub trait SplatOps: Backend {
         refine_weight: FloatTensor<Self>,
         coeffs_grad_sq: FloatTensor<Self>,
         render_mode: SplatRenderMode,
+        raster_mode: RasterizationMode,
         background: Vec3,
         pass: gaussian_splats::RasterPass,
     ) -> impl Future<Output = RenderOutput<Self>>;

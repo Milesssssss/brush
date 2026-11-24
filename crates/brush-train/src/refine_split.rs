@@ -241,6 +241,7 @@ fn tiny_batch() -> SceneBatch {
         img_packed: TensorData::new(vec![pixel; 32 * 32], [32usize, 32]),
         has_alpha: false,
         alpha_mode: AlphaMode::Transparent,
+        depth: None,
         camera: Camera::new(
             Vec3::new(0.0, 0.0, 4.0),
             Quat::IDENTITY,
