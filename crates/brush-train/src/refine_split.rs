@@ -14,10 +14,10 @@ use std::f32::consts::FRAC_1_SQRT_2;
 
 use brush_dataset::scene::SceneBatch;
 use brush_render::{
-    AlphaMode,
+    AlphaMode, TextureMode,
     bounding_box::BoundingBox,
     camera::Camera,
-    gaussian_splats::{Splats, inverse_sigmoid},
+    gaussian_splats::{Splats, inverse_sigmoid, render_splats},
     kernels::camera_model::CameraModel::Pinhole,
 };
 use burn::module::Module;
@@ -188,13 +188,12 @@ struct Prepared {
     splats: Splats,
 }
 
-fn prepare(device: &Device, specs: &[Spec], max_splats: u32, with_momentum: bool) -> Prepared {
-    let config = config(max_splats);
+fn prepare(device: &Device, specs: &[Spec], config: &TrainConfig, with_momentum: bool) -> Prepared {
     let splats = build_splats(specs, device).valid();
     let bounds = BoundingBox::from_min_max(Vec3::splat(-20.0), Vec3::splat(20.0));
-    let mut trainer = SplatTrainer::new_seeded(&config, device, bounds, 7);
+    let mut trainer = SplatTrainer::new_seeded(config, device, bounds, 7);
     let opt_device = splats.device();
-    let mut optim = SplatOptim::new(&config, splats.sh_degree(), &opt_device);
+    let mut optim = SplatOptim::new(config, splats.sh_degree(), &opt_device);
     if with_momentum {
         install_momentum(&mut optim, specs.len(), &opt_device);
     }
@@ -236,20 +235,41 @@ fn assert_dims(splats: &Splats, optim: &SplatOptim) {
 }
 
 fn tiny_batch() -> SceneBatch {
-    let pixel = 0x80808080u32 as i32;
+    let pixel = 0xffccccccu32 as i32;
     SceneBatch {
         img_packed: TensorData::new(vec![pixel; 32 * 32], [32usize, 32]),
         has_alpha: false,
         alpha_mode: AlphaMode::Transparent,
+        depth: None,
+        view_index: 0,
         camera: Camera::new(
-            Vec3::new(0.0, 0.0, 4.0),
+            Vec3::new(0.0, 0.0, -4.0),
             Quat::IDENTITY,
-            45.0,
-            45.0,
+            std::f64::consts::FRAC_PI_4,
+            std::f64::consts::FRAC_PI_4,
             glam::vec2(0.5, 0.5),
             Pinhole,
         ),
     }
+}
+
+async fn render_alpha(splats: &Splats, camera: &Camera, size: glam::UVec2) -> Vec<f32> {
+    let (rendered, _) = render_splats(
+        splats.clone(),
+        camera,
+        size,
+        Vec3::ZERO,
+        None,
+        TextureMode::Float,
+    )
+    .await;
+    f32s(rendered)
+        .await
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|pixel| pixel[3])
+        .collect()
 }
 
 #[cfg(test)]
@@ -322,7 +342,7 @@ mod tests {
         let Prepared {
             mut trainer,
             splats,
-        } = prepare(&device, &specs, 64, true);
+        } = prepare(&device, &specs, &config(64), true);
         let before_tf = f32s(splats.transforms.val()).await;
 
         let (splats, stats) = trainer.refine(0, splats).await;
@@ -449,12 +469,25 @@ mod tests {
             near(moment[child * 10], 0.0, 1e-5, "new child moment cleared");
         }
 
-        let (splats, step_stats) = trainer.step(tiny_batch(), splats.train()).await;
+        let batch = tiny_batch();
+        let alpha = render_alpha(&splats, &batch.camera, glam::uvec2(32, 32)).await;
+        assert_finite(&alpha, "rendered alpha");
+        assert!(alpha.iter().any(|&value| value > 0.05));
+        let (splats, step_stats) = trainer.step(batch, splats.train()).await;
+        assert!(step_stats.num_visible > 0);
         let loss = f32s(step_stats.loss).await;
         assert_finite(&loss, "training loss");
         assert!(!loss.is_empty(), "loss should be a readable scalar");
         let after = f32s(splats.transforms.val()).await;
         assert_finite(&after, "params after a training step");
+        let after_sh = f32s(splats.sh_coeffs.val()).await;
+        assert!(
+            after_sh[n0 * 3..]
+                .iter()
+                .zip(&sh[n0 * 3..])
+                .any(|(current, before)| (current - before).abs() > 1e-6),
+            "a new child with cleared momentum must learn from the visible image"
+        );
         let optim = trainer.optim.as_ref().expect("optimizer after step");
         assert_dims(&splats.valid(), optim);
         assert_eq!(
@@ -470,7 +503,150 @@ mod tests {
     }
 
     #[wasm_bindgen_test(unsupported = tokio::test)]
+    async fn refine_splits_a_splat_measured_by_the_training_render() {
+        let device = device().await;
+        let config = TrainConfig {
+            split_at_screen_size: 0.18,
+            ..config(16)
+        };
+        let specs = [
+            Spec {
+                mean: Vec3::ZERO,
+                rot: rotated(),
+                scale: Vec3::new(0.85, 0.11, 0.09),
+                opacity: 0.6,
+                sh: 0.2,
+                screen: 0.0,
+            },
+            Spec {
+                mean: Vec3::new(0.65, 0.0, 0.0),
+                rot: Quat::IDENTITY,
+                scale: Vec3::splat(0.06),
+                opacity: 0.6,
+                sh: 0.4,
+                screen: 0.0,
+            },
+        ];
+        let bounds = BoundingBox::from_min_max(Vec3::splat(-5.0), Vec3::splat(5.0));
+        let mut trainer = SplatTrainer::new_seeded(&config, &device, bounds, 7);
+        let splats = build_splats(&specs, &device).train();
+        let (splats, step) = trainer.step(tiny_batch(), splats).await;
+        assert_eq!(step.num_visible, 2);
+        let means = f32s(splats.means()).await;
+        let scales = f32s(splats.scales()).await;
+
+        let (splats, refine) = trainer.refine(1, splats.valid()).await;
+        assert_eq!(refine.num_split_oversized, 1);
+        assert_eq!(refine.num_added, 1);
+        assert_eq!(refine.total_splats, 3);
+        let refined_means = f32s(splats.means()).await;
+        let refined_scales = f32s(splats.scales()).await;
+        near_vec(
+            (row3(&refined_means, 0) + row3(&refined_means, 2)) * 0.5,
+            row3(&means, 0),
+            1e-5,
+            "real split preserves the parent centroid",
+        );
+        for index in [0, 2] {
+            near(
+                row3(&refined_scales, index).x,
+                row3(&scales, 0).x * 0.5,
+                1e-5,
+                "severe screen projection reaches the shrink floor",
+            );
+        }
+        near_vec(
+            row3(&refined_scales, 1),
+            row3(&scales, 1),
+            1e-5,
+            "the visible smaller splat is not split",
+        );
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[tokio::test]
+    #[ignore = "Manual alpha comparison of the existing offset and a more compact placement"]
+    async fn compare_needle_split_offsets() {
+        let device = device().await;
+        let side = tiny_batch().camera;
+        let end = Camera {
+            position: Vec3::new(0.0, -4.0, 0.0),
+            rotation: Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2),
+            ..side
+        };
+        let size = glam::uvec2(160, 160);
+        for opacity in [0.2, 0.5, 0.8] {
+            let specs = [Spec {
+                mean: Vec3::ZERO,
+                rot: rotated(),
+                scale: Vec3::new(0.5, 0.035, 0.035),
+                opacity,
+                sh: 0.2,
+                screen: 0.6,
+            }];
+            let Prepared {
+                mut trainer,
+                splats: parent,
+            } = prepare(&device, &specs, &config(16), false);
+            let (baseline, refine) = trainer.refine(0, parent.clone()).await;
+            assert_eq!(refine.num_added, 1);
+
+            let child_scales = f32s(baseline.scales()).await;
+            let offset = specs[0].rot * (specs[0].scale - row3(&child_scales, 0));
+            let mut compact = baseline.clone();
+            let means =
+                Tensor::from_floats([(-offset).to_array(), offset.to_array()], &compact.device());
+            compact.transforms = compact
+                .transforms
+                .map(|values| values.slice_assign(burn::tensor::s![.., 0..3], means));
+
+            for (view, camera) in [("side", side), ("end", end)] {
+                let target = render_alpha(&parent, &camera, size).await;
+                let silhouette = target.iter().filter(|&&alpha| alpha >= 0.05).count();
+                assert!(silhouette > 0);
+                for (variant, splats) in [("baseline", &baseline), ("compact", &compact)] {
+                    let alpha = render_alpha(splats, &camera, size).await;
+                    let mut outside_alpha = 0.0;
+                    let mut inside_alpha = 0.0;
+                    let mut inside_error = 0.0;
+                    let mut parent_inside_alpha = 0.0;
+                    let mut retained_pixels = 0;
+                    for (&value, &reference) in alpha.iter().zip(&target) {
+                        if reference >= 0.05 {
+                            inside_alpha += value;
+                            inside_error += (value - reference).abs();
+                            parent_inside_alpha += reference;
+                            retained_pixels += usize::from(value >= 0.05);
+                        } else {
+                            outside_alpha += value;
+                        }
+                    }
+                    println!(
+                        "opacity={opacity:.2} {view}/{variant}: outside alpha={outside_alpha:.3}, inside alpha ratio={:.3}, inside MAE={:.4}, retained silhouette={:.3}",
+                        inside_alpha / parent_inside_alpha,
+                        inside_error / silhouette as f32,
+                        retained_pixels as f32 / silhouette as f32,
+                    );
+                }
+            }
+        }
+    }
+
+    #[wasm_bindgen_test(unsupported = tokio::test)]
     async fn faint_children_are_pruned_without_sitting_on_the_floor() {
+        assert_faint_children_pruned(config(32)).await;
+    }
+
+    #[wasm_bindgen_test(unsupported = tokio::test)]
+    async fn faint_children_are_pruned_with_default_3d_filter() {
+        assert_faint_children_pruned(TrainConfig {
+            min_scale_factor: TrainConfig::default().min_scale_factor,
+            ..config(32)
+        })
+        .await;
+    }
+
+    async fn assert_faint_children_pruned(config: TrainConfig) {
         let device = device().await;
         let specs = vec![
             Spec {
@@ -501,15 +677,23 @@ mod tests {
         let Prepared {
             mut trainer,
             splats,
-        } = prepare(&device, &specs, 32, true);
+        } = prepare(&device, &specs, &config, true);
+        let camera = tiny_batch().camera;
+        trainer.set_view_cams(vec![(camera.position, camera.focal(glam::uvec2(32, 32)).x)]);
 
         let (splats, stats) = trainer.refine(0, splats).await;
+        assert_eq!(splats.min_scale.is_some(), config.min_scale_factor > 0.0);
         assert_eq!(stats.num_pruned, 0, "0.005 is still above the prune floor");
         assert_eq!(stats.num_added, 1, "only the faint parent splits");
         let sh = f32s(splats.sh_coeffs.val()).await;
+        // Check raw activations too, so filtering cannot hide a restored split opacity floor.
+        let raw_opac = f32s(burn::tensor::activation::sigmoid(
+            splats.raw_opacities.val(),
+        ))
+        .await;
         let opac = f32s(splats.opacities()).await;
         let mut faint = 0;
-        for (op, marker) in opac.iter().zip(sh.chunks(3)) {
+        for ((op, raw), marker) in opac.iter().zip(raw_opac).zip(sh.as_chunks::<3>().0) {
             if (marker[0] - 0.11).abs() < 1e-4 {
                 faint += 1;
                 assert!(
@@ -517,8 +701,8 @@ mod tests {
                     "faint child opacity {op} was lifted to the prune floor {MIN_OPACITY}"
                 );
                 assert!(
-                    (op - MIN_OPACITY).abs() > 1e-4,
-                    "faint child opacity {op} is sitting on {MIN_OPACITY}"
+                    raw < MIN_OPACITY - 1e-4,
+                    "faint child raw alpha {raw} did not fall below the prune threshold"
                 );
             }
         }
@@ -591,7 +775,7 @@ mod tests {
         let Prepared {
             mut trainer,
             splats,
-        } = prepare(&device, &specs, 4, true);
+        } = prepare(&device, &specs, &config(4), true);
         let (splats, stats) = trainer.refine(0, splats).await;
         assert_eq!(stats.num_added, 1, "the last slot splits one parent");
         assert_eq!(splats.num_splats(), 4, "budget is now full");
@@ -625,7 +809,7 @@ mod tests {
         let Prepared {
             mut trainer,
             splats,
-        } = prepare(&device, &specs, specs.len() as u32, true);
+        } = prepare(&device, &specs, &config(specs.len() as u32), true);
         let before = f32s(splats.scales()).await;
         let (splats, stats) = trainer.refine(0, splats).await;
         assert_eq!(stats.num_added, 0, "full budget does not split");
@@ -640,7 +824,7 @@ mod tests {
         let Prepared {
             mut trainer,
             splats,
-        } = prepare(&device, &specs, 1, true);
+        } = prepare(&device, &specs, &config(1), true);
         let before = f32s(splats.scales()).await;
         let (splats, stats) = trainer.refine(0, splats).await;
         assert_eq!(stats.num_added, 0, "over-budget input adds nothing");

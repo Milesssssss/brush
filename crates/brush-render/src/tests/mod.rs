@@ -778,7 +778,7 @@ async fn packed_readback_is_rgba8() {
 
     // The kernel truncates rather than rounds, so allow the odd 1-LSB slip.
     let expect = [bg.x, bg.y, bg.z, 0.0].map(|c| (c * 255.0) as u8);
-    for (i, px) in bytes.chunks_exact(4).enumerate() {
+    for (i, px) in bytes.as_chunks::<4>().0.iter().enumerate() {
         assert!(
             px.iter()
                 .zip(expect)

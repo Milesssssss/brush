@@ -1,6 +1,7 @@
 use std::ops::RangeInclusive;
 use std::path::PathBuf;
 
+use brush_dataset::config::DepthMode;
 use brush_process::config::TrainStreamConfig;
 use brush_render::AlphaMode;
 use brush_render::gaussian_splats::SplatRenderMode;
@@ -199,6 +200,13 @@ fn draw_training(ui: &mut Ui, args: &mut TrainStreamConfig, enabled: bool) {
             false,
             enabled,
         );
+        ui.add_enabled(
+            enabled,
+            egui::Checkbox::new(
+                &mut tc.appearance_compensation,
+                "Per-image exposure and white balance",
+            ),
+        );
         slider(
             ui,
             &mut tc.opac_decay,
@@ -220,6 +228,14 @@ fn draw_training(ui: &mut Ui, args: &mut TrainStreamConfig, enabled: bool) {
             &mut tc.match_alpha_weight,
             0.01..=1.0,
             "Alpha match weight",
+            false,
+            enabled,
+        );
+        slider(
+            ui,
+            &mut tc.depth_loss_weight,
+            0.0..=1.0,
+            "Depth loss weight (0 disables)",
             false,
             enabled,
         );
@@ -325,6 +341,34 @@ fn draw_dataset(ui: &mut Ui, args: &mut TrainStreamConfig, enabled: bool) {
         "",
         false,
         enabled,
+    );
+
+    let mode = &mut args.load_config.depth_mode;
+    let old_mode = *mode;
+    ui.add_enabled_ui(enabled, |ui| {
+        let label = match mode {
+            DepthMode::Metric => "Metric camera Z",
+            DepthMode::RelativeInverse => "Relative inverse depth",
+        };
+        egui::ComboBox::from_id_salt("depth_mode")
+            .selected_text(label)
+            .show_ui(ui, |ui| {
+                ui.selectable_value(mode, DepthMode::Metric, "Metric camera Z");
+                ui.selectable_value(mode, DepthMode::RelativeInverse, "Relative inverse depth");
+            });
+    });
+    if *mode != old_mode && *mode == DepthMode::RelativeInverse {
+        args.load_config.estimate_metric_scale = false;
+    }
+    ui.add_enabled(
+        enabled && *mode == DepthMode::Metric,
+        egui::Checkbox::new(
+            &mut args.load_config.estimate_metric_scale,
+            "Estimate metric scale from depth maps",
+        ),
+    )
+    .on_hover_text(
+        "COLMAP only. Uses depth maps and projected landmarks. Off by default, and skipped when no depth maps are present.",
     );
 
     ui.label("Dataset units per metre");

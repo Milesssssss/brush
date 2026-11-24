@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 use web_time::Instant;
 
+use crate::ui::depth_bar::draw_depth_colorbar;
 use crate::ui::panels::AppPane;
 use crate::ui::settings_popup::SettingsPopup;
 use crate::ui::splat_backbuffer::SplatBackbuffer;
@@ -560,6 +561,15 @@ impl ScenePanel {
             process.set_cam_settings(&settings);
         }
 
+        let mut settings = process.get_cam_settings();
+        if ui
+            .checkbox(&mut settings.depth_view, "Depth map")
+            .on_hover_text("Show rendered depth with a turbo colormap")
+            .changed()
+        {
+            process.set_cam_settings(&settings);
+        }
+
         ui.label(RichText::new("Background").size(12.0));
 
         ui.separator();
@@ -1030,6 +1040,9 @@ impl AppPane for ScenePanel {
             // Adjust FOV so that the scene view shows at least what's visible in the dataset view.
             camera.fit_fov_to_size(size);
 
+            // Depth range of the frame currently on screen, for the colorbar.
+            let mut depth_range = None;
+
             // Render the splats and grid
             ui.scope(|ui| {
                 // if training views have alpha, show a background checker. Masked images
@@ -1050,7 +1063,7 @@ impl AppPane for ScenePanel {
                 }
 
                 if let Some(backbuffer) = &mut self.backbuffer {
-                    backbuffer.paint(
+                    depth_range = backbuffer.paint(
                         rect,
                         ui,
                         &process.current_splats(),
@@ -1058,6 +1071,7 @@ impl AppPane for ScenePanel {
                         self.frame as usize,
                         settings.background.unwrap_or(Vec3::ZERO),
                         settings.splat_scale,
+                        settings.depth_view,
                         self.splats_dirty,
                     );
                     self.splats_dirty = false;
@@ -1071,6 +1085,10 @@ impl AppPane for ScenePanel {
             });
 
             self.update_and_draw_reference_pose_bars(ui, rect, &camera, delta_time);
+
+            if let Some((depth_min, depth_max)) = depth_range {
+                draw_depth_colorbar(ui, rect, depth_min, depth_max, "Camera Z (scene units)");
+            }
 
             if interactive {
                 self.draw_play_pause(ui, rect);

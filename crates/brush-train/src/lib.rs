@@ -8,6 +8,7 @@ pub mod msg;
 pub mod train;
 
 mod adam_scaled;
+mod appearance;
 mod multinomial;
 mod quat_vec;
 mod split;

@@ -65,9 +65,11 @@ fn test_batch(width: u32, height: u32) -> SceneBatch {
         })
         .collect();
     SceneBatch {
+        view_index: 0,
         img_packed: TensorData::new(img, [height as usize, width as usize]),
         has_alpha: false,
         alpha_mode: AlphaMode::Transparent,
+        depth: None,
         camera: Camera::new(
             Vec3::new(0.0, 0.0, 3.0),
             Quat::IDENTITY,

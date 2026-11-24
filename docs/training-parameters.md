@@ -109,11 +109,31 @@ Fewer views and fewer SfM points mean less work per step and a smaller starting 
 - Use `--subsample-frames 2` or `4` to scout settings
 - `--subsample-points` helps when the init PLY is huge (also see `--max-splats` subsampling at load)
 
+## Depth supervision
+
+Off unless you opt in. Existing runs are unchanged.
+
+| Flag | Default | What it does |
+| --- | --- | --- |
+| `--depth-loss-weight` | `0` | Weight of depth supervision against COLMAP `depth/*.tiff`. `0` keeps the four-channel color renderer. |
+| `--depth-mode` | `metric` | `metric` compares inverse camera Z. `relative-inverse` uses masked patch and image-scale normalization on unitless, near-high inverse depth. |
+| `--estimate-metric-scale` | off | One global scale from those depth maps and projected landmarks. Skipped when no depth maps are present. `--units-per-meter` still applies afterwards. |
+
+Match each single-channel float32 TIFF to its RGB stem (`images/frame.png` → `depth/frame.tiff`). Metric samples must be finite and positive. `--estimate-metric-scale` uses the metric map's own resolution and scales whichever initializer is used, including an overriding PLY. Values and camera positions are divided by `--units-per-meter` before the metric loss.
+
+Relative inverse depth accepts finite signed values and uses non-finite values to mark invalid pixels. Leave the TIFF values in their original unitless scale. The loss uses 11×11 patches, a normalized residual margin of 0.2, and local and image-scale terms weighted 0.1 and 1.0 before applying `--depth-loss-weight`. The source alpha mask weights the statistics and the residuals. Relative-inverse mode excludes pixels with no rendered depth and requires metric scale estimation to be off.
+
 ## Learning rates and loss (usually leave alone)
 
-`--lr-mean`, `--lr-mean-end`, `--lr-coeffs-dc`, `--lr-opac`, `--lr-scale`, `--lr-rotation`, `--ssim-weight`, and related flags match common Gaussian-splatting defaults.
+`--lr-mean`, `--lr-mean-end`, `--lr-coeffs-dc`, `--lr-opac`, `--lr-scale`, `--lr-rotation`, `--ssim-weight`, and related flags match common Gaussian-splatting defaults. `--depth-loss-weight` stays `0` unless the scene has depth maps you want to supervise with.
 
 Touch these only when diagnosing divergence or known scene quirks. Prefer resolution, growth, and iteration budget for normal tuning.
+
+## Per-image appearance compensation
+
+Enable `--appearance-compensation` when images have different exposure or white balance. Brush learns an RGB affine for each training image and regularizes the individual transforms and their mean toward the identity. The transform acts on foreground color and preserves opacity and the synthetic background.
+
+Evaluation applies the learned correction to matching training images and reports those scores separately when held-out views are available. Held-out images and the free camera use the scene's canonical color. Use `--checkpoint-every` and resume with `--appearance-compensation` to restore the corrections and their optimizer by dataset-relative image path. PLY exports contain the canonical splat colors and remain independently viewable.
 
 ## Process / export knobs (time and disk, not model size)
 

@@ -1,0 +1,62 @@
+# Brush fork 维护指南
+
+## 工作约定
+
+- 以 `origin/main` 为 fork 基线，以 `upstream/main` 跟踪 ArthurBrussee/brush。同步上游与功能改动分别提交，保留已有 fork 行为。
+- 按仓库 CI 使用 Rust 1.100.0、Cargo workspace 和锁定依赖。修改 manifest 后用 Cargo 更新 `Cargo.lock`。测试走实际加载、渲染和训练入口，断言能在恢复原缺陷时失败。
+- 除非用户另有说明，禁止使用 Superpowers skills。沿用仓库流程，避免预防性改动和内部重复校验。新增功能默认关闭，默认路径须有回归对照。
+- 主机承担方案、执行拆解、环境与依赖、故障排查和验收。使用执行协作时，给出已验证的输入、命令、改动边界和停止条件。
+
+## Issue #3 漂浮 splat
+
+实施基线 `6d73e74` 已纳入 [原仓六个提交](https://github.com/ArthurBrussee/brush/compare/1388f74...d43bd1e)。保留本地 `main` 作为同步基线，在维护分支实施。按以下顺序检查交付，每步保留独立的基线与功能开关。[fork issue #3](https://github.com/Milesssssss/brush/issues/3)
+
+1. 补实已有 split 与 reset。保留 `k >= 0.5`、弱子体可剪枝以及满预算停止分裂的行为。修正训练测试相机，断言实际可见覆盖和参数更新。验证默认 3D filter 下弱子体的剪枝。在真实训练循环中检查 refine 先于 reset、有效 alpha 上限（默认 3D filter 计入）、Adam 状态、断点恢复和阶段截止。针状 splat 的贴合偏移单独做 A/B，比较前景细节和侧视／端视轮廓外 alpha 再决定是否采用。[fork #6](https://github.com/Milesssssss/brush/pull/6) · [fork #5](https://github.com/Milesssssss/brush/pull/5)
+2. 接入 fork #4 的 `4115ef9`，验证 COLMAP TIFF、尺度估计与初始化 PLY、遮罩、无效深度和两个预览入口。度量模式继续用摄像机 Z 的逆深度误差。权重为零保留四通道 RGB 训练路径。用真实 `SplatTrainer::step` 验证遮罩外深度变化无影响、全零遮罩和非有限目标，以及旋转相机下有可预期的深度梯度和损失下降。验证五通道渲染输出的 RGBA 与普通路径一致。[fork #4](https://github.com/Milesssssss/brush/pull/4) · [原仓 #497](https://github.com/ArthurBrussee/brush/pull/497)
+3. 复用 TIFF 与深度通道，加入可选相对逆深度模式。约定近处值大、无单位，样本采用遮罩加权的局部与全局归一化。相对值绕过度量尺度估计和单位变换，预测器保持离线。覆盖正仿射变换、深度符号反转、边缘 patch、空权重和真实训练更新。[DNGaussian 参考](https://github.com/Fictionarry/DNGaussian/blob/main/utils/loss_utils.py#L73-L83)
+4. 加入可选的每训练图 3×4 RGB 仿射，从恒等初始化，正则约束，只修正前景 RGB。用数据集相对图像路径匹配评估和 checkpoint，保存参数及 Adam 状态。留出视图和自由相机使用标准颜色，PLY 仍可独立查看。覆盖遮罩和透明输入、视图顺序变化、断点重载，以及受控曝光变化的 A/B。借鉴 #483 的视图索引和评估匹配，只有 A/B 显示存在剩余空间性或非线性色偏才评估 bilateral grid 或 PPISP。[原仓 #483](https://github.com/ArthurBrussee/brush/pull/483)
+
+复用已纳入的 #479 分裂与滤波、#562 checkpoint、#512 光栅化和 #565 macOS 原生 Metal。#353 的多视图剪枝待以上实验有数据后再评估。[#479](https://github.com/ArthurBrussee/brush/pull/479) · [#562](https://github.com/ArthurBrussee/brush/pull/562) · [#512](https://github.com/ArthurBrussee/brush/pull/512) · [#565](https://github.com/ArthurBrussee/brush/pull/565) · [#353](https://github.com/ArthurBrussee/brush/pull/353)
+
+### 分裂偏移决定
+
+单针渲染 A/B 中，紧凑偏移减少了侧视轮廓外 alpha，但把轮廓覆盖从 100% 降到约 86%–89%，并增加了轮廓内 alpha 误差。保留现有分裂偏移。可用 `cargo +1.100.0 test --locked -p brush-train --lib compare_needle_split_offsets -- --ignored --nocapture` 复现。
+
+## 验收
+
+- 运行仓库格式、Clippy、原生测试和 WASM 编译。WGPU 单元测试、实际 Metal 训练和浏览器／桌面预览各自记录证据。编译通过只记录为编译结果。
+- 组合短跑覆盖实际 split、refine、reset 与 checkpoint 恢复。resume 测试对照相同批次或对照调度事件，现有 checkpoint 会重新启动数据加载顺序。
+- 固定数据版本、相机、遮罩、初始 PLY、训练／留出划分、采样顺序、后端和训练预算。记录轮廓外 alpha、前景覆盖与细节、留出 RGB 误差，以及独立真值深度误差。用重复基线设定容差，再比较单项和组合。切换深度预览时检查有效区间、无效值、单位与缺失深度的行为。
+
+### 本地验收记录
+
+- 180 步合成场景 A/B 使用原生 Metal、同一初始 PLY 和固定视图顺序。两次 RGB 基线的留出深度 MAE 为 0.1343–0.1357，度量深度降到 0.0984，相对逆深度降到 0.1146。以 alpha ≥ 0.25 计，三组的前景覆盖均为 100%。
+- 外观补偿加入均值约束和遮罩邻域修正后，曝光变化组的留出前景 PSNR 从 21.78 dB 变为 21.17 dB，轮廓外平均 alpha 从 0.01948 变为 0.02036。平衡曝光组的轮廓外平均 alpha 从 0.02022 降到 0.01981，留出前景 PSNR 从 21.77 dB 变为 20.85 dB。每 48 步 reset 的组合组执行了 split、三次 reset 和一次 checkpoint 恢复，留出前景 PSNR 为 17.12 dB。外观和 reset 作为可选项保留，真实采集场景质量待验证。
+- 原生 Metal CLI 在第 30 步写出组合 checkpoint，恢复训练到第 42 步，并在预定的第 32 阶段步触发 reset。格式、Clippy 和 87 项原生回归通过，手动单针 A/B 单独执行。
+- macOS 桌面在同一窗口显示场景 Camera Z 和无单位的相对逆深度，切换图像后 TIFF 深度范围随之更新。WASM 编译通过。Chrome 适配器的每阶段存储缓冲上限是 10，投影前向和反向内核分别需要 12 和 11，关闭新功能的 RGB 对照也触发了这一限制。浏览器运行验收需要单独适配渲染器绑定布局。
+- 合成训练对照可从 [`crates/brush-bench-test/test_cases/issue3`](crates/brush-bench-test/test_cases/issue3/README.md) 重新生成并运行。生成的数据和日志放在 `target/`。
+
+### 默认 RGB 性能补测
+
+在 Apple M5 24 GiB、原生 Metal 上比较同步基线 `6d73e74` 和 PR #8 的中间提交 `2621103`。从一份无 TIFF 的 1,514 视图 COLMAP 采集中固定抽取 64 帧，两版使用同一份 372,790 点初始化和帧顺序，各跑两次 128 步，深度损失、曝光补偿和透明度重置均关闭。以下步时为第二遍 64 个已缓存训练批次的结果，覆盖 GPU 同步。
+
+| 指标 | 同步基线 | PR #8 中间版 |
+| --- | ---: | ---: |
+| 稳态步时中位数，ms/步 | 63.03–63.32 | 63.40–64.33 |
+| 进程峰值 RSS，GiB | 2.56–2.78 | 2.57–2.97 |
+
+另外在 PR 中间版上，用 64 张 800×600 图的配对夹具测 loader。权重为 0 时，带匹配 TIFF 的夹具仍读取并缓存深度，批次载荷从 122,880,000 增到 245,760,000 字节，三次缓存填满的中位数从 48.80 增到 83.60 ms。真实数据结果只覆盖这 64 个训练批次和短程训练，长程步时及设备峰值内存仍未测量。
+
+### 曝光补偿后续对照
+
+用两种合成曝光模式分别重复两次 180 步 Metal 训练。每组固定初始化、训练顺序和两个干净留出视图，报告未做后处理的留出前景 PSNR。
+
+| 补偿方式 | 平衡曝光变化，dB | 较强曝光变化，dB |
+| --- | ---: | ---: |
+| 关闭 | 21.74–21.75 | 21.74–21.76 |
+| 固定使用夹具生成时的曝光参数 | 22.43–22.45 | 22.46–22.48 |
+| 从恒等变换联合学习全仿射 | 20.81–20.86 | 21.15–21.17 |
+| 从已知曝光参数开始联合学习 | 21.02–21.03 | 21.35–21.39 |
+| 联合学习三通道增益与共享偏置 | 21.13–21.17 | 21.29–21.31 |
+
+已知曝光参数固定使用时，合成场景的留出 PSNR 提高约 0.7 dB，轮廓外平均 alpha 也下降。三种联合学习方式在这两种合成曝光模式下均低于关闭组。PR 的曝光补偿继续保持默认关闭，固定参数、已知初始化和四参数实现保留为本地验收实验。

@@ -11,6 +11,8 @@ use burn::tensor::{Device, Int, Tensor, s};
 use glam::Vec3;
 use image::DynamicImage;
 
+use crate::appearance::correct_image;
+
 pub struct EvalSample {
     pub gt_img: DynamicImage,
     pub rendered: Tensor<3>,
@@ -26,6 +28,17 @@ pub async fn eval_stats(
     alpha_mode: AlphaMode,
     device: &Device,
 ) -> Result<EvalSample> {
+    eval_stats_with_appearance(splats, gt_cam, gt_img, alpha_mode, device, None).await
+}
+
+pub async fn eval_stats_with_appearance(
+    splats: Splats,
+    gt_cam: &Camera,
+    gt_img: DynamicImage,
+    alpha_mode: AlphaMode,
+    device: &Device,
+    appearance: Option<Tensor<2>>,
+) -> Result<EvalSample> {
     let res = glam::uvec2(gt_img.width(), gt_img.height());
 
     let (gt_packed_data, _has_alpha) = view_to_packed_data(gt_img.clone(), alpha_mode);
@@ -34,6 +47,10 @@ pub async fn eval_stats(
     // Render on reference black background.
     let (img, render_aux) =
         render_splats(splats, gt_cam, res, Vec3::ZERO, None, TextureMode::Float).await;
+    let img = match appearance {
+        Some(delta) => correct_image(img, delta, Vec3::ZERO),
+        None => img,
+    };
     let render_rgb = img.slice(s![.., .., 0..3]);
 
     // Simulate an 8-bit roundtrip for fair comparison.

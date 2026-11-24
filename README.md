@@ -31,6 +31,19 @@ It also supports masking images:
 
 For practical guidance on CLI training flags (how to trade off run length, splat count, and VRAM), see [docs/training-parameters.md](docs/training-parameters.md).
 
+### Depth supervision
+
+COLMAP datasets can include a `depth` folder of single-channel float32 TIFF depth maps, matched to the RGB images by file stem (`images/frame.png` pairs with `depth/frame.tiff`, or with the same relative subdirectory). Other dataset formats ignore these files.
+
+`--depth-loss-weight` defaults to `0`, which keeps the four-channel color render. The `--depth-mode` option controls how Brush interprets the TIFFs.
+
+- `metric` (default) expects positive finite camera Z in the dataset's units. Samples are divided by `--units-per-meter` along with the cameras. The loss is L1 on inverse depth over valid samples.
+- `relative-inverse` expects unitless inverse-depth predictions from an offline predictor. Larger values mean closer. Zero and negative values are valid, and non-finite values mark invalid pixels. The loss compares normalized local patches of rendered inverse depth and target values, with a second term using image-wide scales. TIFF values bypass metric unit conversion. `--estimate-metric-scale` requires metric depth.
+
+For metric maps, `--estimate-metric-scale` estimates one global scale from projected COLMAP landmarks. It samples in the depth map's resolution and scales the cameras and selected initializer, including an overriding `init.ply` in the same original reconstruction coordinates. `--units-per-meter` is applied afterwards.
+
+The depth loss uses alpha-weighted expected camera Z with blending weights held fixed during its backward pass. Masked views weight each depth contribution by the source mask alpha. In the viewer, **Depth map** shows rendered camera Z. In the dataset panel, **Depth** shows the paired TIFF values with the selected convention.
+
 ### Checkpoints
 
 Training can be stopped and later continued without quality loss. Pass `--checkpoint-every 1000` to write a full checkpoint
