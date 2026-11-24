@@ -3,6 +3,8 @@
 
 use glam::{Quat, Vec3};
 
+use crate::config::DepthMode;
+
 /// Google's turbo colormap, evaluated as the degree-6 polynomial from the
 /// original reference. `t` is clamped to `[0, 1]`.
 #[allow(clippy::excessive_precision)]
@@ -33,37 +35,40 @@ pub fn turbo_u8(t: f32) -> [u8; 3] {
     ]
 }
 
-/// RGBA8 image of a depth map. Non-positive and non-finite samples are
-/// transparent and do not contribute to the color scale.
+/// RGBA8 image of a depth map. Invalid samples are transparent and do not
+/// contribute to the color scale.
 pub struct DepthColorImage {
     pub rgba: Vec<u8>,
-    pub min: f32,
-    pub max: f32,
+    pub range: Option<(f32, f32)>,
 }
 
-pub fn colorize_depth(depth: &[f32], width: usize, height: usize) -> DepthColorImage {
+pub fn colorize_depth(
+    depth: &[f32],
+    width: usize,
+    height: usize,
+    mode: DepthMode,
+) -> DepthColorImage {
     assert_eq!(
         depth.len(),
         width.saturating_mul(height),
         "depth buffer must cover every pixel"
     );
+    let usable = |d: f32| d.is_finite() && (mode == DepthMode::RelativeInverse || d > 0.0);
     let mut min = f32::INFINITY;
     let mut max = f32::NEG_INFINITY;
     for &d in depth {
-        if d.is_finite() && d > 0.0 {
+        if usable(d) {
             min = min.min(d);
             max = max.max(d);
         }
     }
-    let has_range = min.is_finite() && max.is_finite();
-    if !has_range {
-        min = 0.0;
-        max = 1.0;
+    let mut rgba = vec![0u8; depth.len() * 4];
+    if min > max {
+        return DepthColorImage { rgba, range: None };
     }
     let span = (max - min).max(1e-6);
-    let mut rgba = vec![0u8; depth.len() * 4];
     for (i, &d) in depth.iter().enumerate() {
-        if d.is_finite() && d > 0.0 {
+        if usable(d) {
             let t = ((d - min) / span).clamp(0.0, 1.0);
             let rgb = turbo_u8(t);
             let o = i * 4;
@@ -73,7 +78,10 @@ pub fn colorize_depth(depth: &[f32], width: usize, height: usize) -> DepthColorI
             rgba[o + 3] = 255;
         }
     }
-    DepthColorImage { rgba, min, max }
+    DepthColorImage {
+        rgba,
+        range: Some((min, max)),
+    }
 }
 
 /// Nearest-neighbour resize. Identical sizes return a copy.
@@ -179,9 +187,8 @@ mod tests {
 
     #[test]
     fn colorize_ignores_invalid_samples() {
-        let image = colorize_depth(&[0.0, 2.0, f32::NAN, 4.0], 4, 1);
-        assert!((image.min - 2.0).abs() < 1e-6);
-        assert!((image.max - 4.0).abs() < 1e-6);
+        let image = colorize_depth(&[0.0, 2.0, f32::NAN, 4.0], 4, 1, DepthMode::Metric);
+        assert_eq!(image.range, Some((2.0, 4.0)));
         assert_eq!(&image.rgba[0..4], &[0, 0, 0, 0]);
         assert_eq!(image.rgba[7], 255);
         assert_eq!(image.rgba[15], 255);
@@ -190,12 +197,20 @@ mod tests {
 
     #[test]
     fn colorize_without_valid_depth_is_transparent() {
-        let image = colorize_depth(&[0.0, -1.0], 2, 1);
-        assert_eq!(image.min, 0.0);
-        assert_eq!(image.max, 1.0);
+        let image = colorize_depth(&[0.0, -1.0], 2, 1, DepthMode::Metric);
+        assert_eq!(image.range, None);
         assert!(image.rgba.iter().all(|b| *b == 0));
     }
 
+    #[test]
+    fn relative_depth_preview_includes_finite_signed_samples() {
+        let image = colorize_depth(&[-4.0, 0.0, f32::NAN], 3, 1, DepthMode::RelativeInverse);
+        assert_eq!(image.range, Some((-4.0, 0.0)));
+        assert_eq!(
+            (image.rgba[3], image.rgba[7], image.rgba[11]),
+            (255, 255, 0)
+        );
+    }
     #[test]
     fn resample_is_identity_when_sizes_match() {
         let src = [1.0, 2.0, 3.0, 4.0];

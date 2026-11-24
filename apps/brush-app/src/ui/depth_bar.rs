@@ -1,9 +1,13 @@
 use brush_dataset::depth::turbo_u8;
 use egui::{Align2, Color32, Rect};
 
-/// Vertical turbo colorbar with the depth range labelled in the same units
-/// as the map (metres when the depth maps are metric).
-pub(crate) fn draw_depth_colorbar(ui: &egui::Ui, rect: Rect, depth_min: f32, depth_max: f32) {
+pub(crate) fn draw_depth_colorbar(
+    ui: &egui::Ui,
+    rect: Rect,
+    depth_min: f32,
+    depth_max: f32,
+    label: &str,
+) {
     let painter = ui.painter_at(rect);
     let bar_w = 16.0;
     let bar_h = (rect.height() * 0.4).clamp(80.0, 240.0);
@@ -37,6 +41,13 @@ pub(crate) fn draw_depth_colorbar(ui: &egui::Ui, rect: Rect, depth_min: f32, dep
     }
 
     let font = egui::FontId::new(11.0, egui::FontFamily::Proportional);
+    painter.text(
+        egui::pos2(bar_rect.max.x, bar_rect.min.y - 16.0),
+        Align2::RIGHT_BOTTOM,
+        label,
+        font.clone(),
+        Color32::WHITE,
+    );
     painter.text(
         egui::pos2(bar_rect.min.x - 6.0, bar_rect.min.y),
         Align2::RIGHT_CENTER,

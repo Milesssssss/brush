@@ -398,7 +398,7 @@ async fn read_dataset_inner(
 #[cfg(all(test, not(target_family = "wasm")))]
 mod tests {
     use super::*;
-    use crate::config::LoadDatasetConfig;
+    use crate::config::{DepthMode, LoadDatasetConfig};
     use std::path::Path;
 
     // Blender / NeRF-synthetic style transforms: no `w`/`h`, and frames
@@ -453,6 +453,7 @@ mod tests {
             alpha_mode: None,
             invert_masks: false,
             units_per_meter: 1.0,
+            depth_mode: DepthMode::Metric,
             estimate_metric_scale: false,
             max_scene_batch_cache_size: 0,
         };

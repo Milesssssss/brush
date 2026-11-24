@@ -1,5 +1,5 @@
 use brush_async::{Actor, AsyncMap};
-use brush_dataset::depth::colorize_depth;
+use brush_dataset::{config::DepthMode, depth::colorize_depth};
 use brush_process::slot::Slot;
 use brush_render::{
     TextureMode, camera::Camera, gaussian_splats::Splats, render_splats, render_splats_depth,
@@ -177,19 +177,12 @@ async fn render_depth_frame(splats: Splats, req: &RenderRequest) -> Frame {
             0.0
         };
     }
-    let colored = colorize_depth(&depth, width, height);
-    let depth_range = colored
-        .rgba
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .any(|px| px[3] > 0)
-        .then_some((colored.min, colored.max));
+    let colored = colorize_depth(&depth, width, height, DepthMode::Metric);
     Frame {
         width: width as u32,
         height: height as u32,
         pixels: Arc::new(colored.rgba),
-        depth_range,
+        depth_range: colored.range,
     }
 }
 

@@ -195,6 +195,27 @@ mod tests {
     }
 
     #[wasm_bindgen_test(unsupported = test)]
+    fn depth_options_default_when_missing_and_relative_mode_round_trips() {
+        use brush_dataset::config::DepthMode;
+
+        let mut json = serde_json::to_value(TrainStreamConfig::default()).unwrap();
+        let settings = json.as_object_mut().unwrap();
+        settings.remove("depth-mode");
+        settings.remove("depth-loss-weight");
+        settings.remove("estimate-metric-scale");
+        let mut config = serde_json::from_value::<TrainStreamConfig>(json).unwrap();
+        assert_eq!(config.load_config.depth_mode, DepthMode::Metric);
+        assert!(!config.load_config.estimate_metric_scale);
+        assert_eq!(config.train_config.depth_loss_weight, 0.0);
+
+        config.load_config.depth_mode = DepthMode::RelativeInverse;
+        config.train_config.depth_loss_weight = 0.25;
+        let reparsed = merge_configs(&config, &TrainStreamConfig::default());
+        assert_eq!(reparsed.load_config.depth_mode, DepthMode::RelativeInverse);
+        assert_eq!(reparsed.train_config.depth_loss_weight, 0.25);
+    }
+
+    #[wasm_bindgen_test(unsupported = test)]
     fn opacity_reset_every_round_trips_and_is_absent_by_default() {
         let default_args = config_to_args(&TrainStreamConfig::default());
         assert!(

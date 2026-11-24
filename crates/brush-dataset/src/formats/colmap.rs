@@ -7,7 +7,7 @@ use std::{
 use super::{DatasetLoadResult, FormatError};
 use crate::{
     Dataset,
-    config::LoadDatasetConfig,
+    config::{DepthMode, LoadDatasetConfig},
     depth::{colmap_camera_depth, depth_pixel_for_landmark, metric_scale_from_pairs},
     formats::{
         find_depth_path, find_image_by_name, find_mask_path, find_points3d_path, split_eval_every,
@@ -229,8 +229,14 @@ async fn load_dataset_inner(
             };
 
             let mask_path = find_mask_path(&vfs, path);
-            let depth = find_depth_path(&vfs, path)
-                .map(|p| LoadDepth::new(vfs.clone(), p.to_path_buf(), load_args.units_per_meter));
+            let depth = find_depth_path(&vfs, path).map(|p| {
+                LoadDepth::new(
+                    vfs.clone(),
+                    p.to_path_buf(),
+                    load_args.depth_mode,
+                    load_args.units_per_meter,
+                )
+            });
 
             // Convert w2c to c2w. `pose_scale` is 1 unless metric scale
             // estimation produced a finite positive scale.
@@ -402,7 +408,12 @@ async fn estimate_metric_scale(
         };
         // File units, not training metres. `units_per_meter` is applied to
         // the geometry and to the training depth targets afterwards.
-        let loader = LoadDepth::new(vfs.clone(), depth_path.to_path_buf(), 1.0);
+        let loader = LoadDepth::new(
+            vfs.clone(),
+            depth_path.to_path_buf(),
+            DepthMode::Metric,
+            1.0,
+        );
         let Ok((depth, width, height)) = loader.load_native().await else {
             log::warn!(
                 "Skipping depth map {} while estimating scale",
@@ -525,7 +536,7 @@ fn build_camera_model(colmap_camera: &ColmapCamera) -> CameraModel {
 
 #[cfg(all(test, not(target_family = "wasm")))]
 mod tests {
-    use crate::config::LoadDatasetConfig;
+    use crate::config::{DepthMode, LoadDatasetConfig};
     use crate::formats::{DatasetLoadResult, load_dataset};
     use brush_render::camera::focal_to_fov;
     use brush_render::kernels::camera_model::CameraModel;
@@ -613,6 +624,7 @@ mod tests {
             alpha_mode: None,
             invert_masks: false,
             units_per_meter: 1.0,
+            depth_mode: DepthMode::Metric,
             estimate_metric_scale: false,
             max_scene_batch_cache_size: 0,
         }
@@ -875,6 +887,44 @@ mod tests {
             glam::Vec3::from_slice(&init.data.means[0..3]),
             glam::vec3(0.0, 0.0, 20.0),
         );
+    }
+
+    #[tokio::test]
+    async fn relative_depth_reaches_the_scene_batch_in_native_values() {
+        let dir = tempfile::tempdir().unwrap();
+        write_metric_depth_dataset(dir.path()).await;
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        tiff::encoder::TiffEncoder::new(&mut bytes)
+            .unwrap()
+            .write_image::<tiff::encoder::colortype::Gray32Float>(2, 2, &[-3.0, 0.0, 4.0, f32::NAN])
+            .unwrap();
+        tokio::fs::write(dir.path().join("depth/view.tiff"), bytes.into_inner())
+            .await
+            .unwrap();
+        let vfs = Arc::new(BrushVfs::from_path(dir.path()).await.unwrap());
+        let config = LoadDatasetConfig {
+            depth_mode: DepthMode::RelativeInverse,
+            units_per_meter: 10.0,
+            ..test_config(None)
+        };
+        let result = load_dataset(vfs.clone(), &config).await.unwrap();
+        let scene = &result.dataset.train;
+        assert_vec3_close(scene.views[0].camera.position, glam::vec3(0.0, 0.0, 0.5));
+        let mut loader = crate::scene_loader::SceneLoader::new(scene, 42, &config);
+        let depth = loader.next_batch().await.depth.expect("paired depth");
+        assert_eq!(depth.mode, DepthMode::RelativeInverse);
+        assert_eq!(depth.data.shape().dims(), [3, 4]);
+        let values = depth.data.try_to_vec::<f32>().unwrap();
+        assert_eq!(values[..6], [-3.0, -3.0, 0.0, 0.0, 4.0, 4.0]);
+        assert!(values[6].is_nan() && values[11].is_nan());
+        assert!(result.metric_scale.is_none());
+
+        let incompatible = LoadDatasetConfig {
+            estimate_metric_scale: true,
+            ..config
+        };
+        let error = load_dataset(vfs, &incompatible).await.err().unwrap();
+        assert!(error.to_string().contains("--depth-mode metric"));
     }
 
     #[tokio::test]

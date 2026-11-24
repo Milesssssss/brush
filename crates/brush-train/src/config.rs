@@ -86,6 +86,11 @@ pub struct TrainConfig {
     #[clap(long, help_heading = "Training options", default_value = "0.2")]
     pub ssim_weight: f32,
 
+    /// Learn an RGB affine correction for each training image.
+    #[arg(long, help_heading = "Training options")]
+    #[serde(default)]
+    pub appearance_compensation: bool,
+
     /// Factor of the opacity decay.
     #[arg(long, help_heading = "Training options", default_value = "0.004")]
     pub opac_decay: f32,
@@ -119,11 +124,10 @@ pub struct TrainConfig {
     #[arg(long, help_heading = "Refine options", default_value = "0.0")]
     pub lpips_loss_weight: f32,
 
-    /// Weight of the inverse-depth L1 loss. `0` (the default) disables it, so
-    /// training is unchanged unless depth maps are loaded and this is raised.
-    /// The loss compares `1 / rendered depth` with `1 / ground-truth depth`
-    /// on pixels whose ground-truth depth is positive.
+    /// Weight of depth supervision with the selected dataset depth mode.
+    /// `0` (the default) uses the four-channel color render.
     #[arg(long, help_heading = "Training options", default_value = "0.0")]
+    #[serde(default)]
     pub depth_loss_weight: f32,
 
     /// Base background color (R,G,B) used during training.

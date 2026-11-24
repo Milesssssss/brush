@@ -133,6 +133,7 @@ fn generate_training_batch(resolution: (u32, u32), camera_pos: Vec3) -> SceneBat
     );
 
     SceneBatch {
+        view_index: 0,
         img_packed,
         has_alpha: false,
         alpha_mode: AlphaMode::Transparent,

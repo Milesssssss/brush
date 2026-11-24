@@ -1087,7 +1087,7 @@ impl AppPane for ScenePanel {
             self.update_and_draw_reference_pose_bars(ui, rect, &camera, delta_time);
 
             if let Some((depth_min, depth_max)) = depth_range {
-                draw_depth_colorbar(ui, rect, depth_min, depth_max);
+                draw_depth_colorbar(ui, rect, depth_min, depth_max, "Camera Z (scene units)");
             }
 
             if interactive {

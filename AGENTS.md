@@ -18,6 +18,10 @@
 
 复用已纳入的 #479 分裂与滤波、#562 checkpoint、#512 光栅化和 #565 macOS 原生 Metal。#353 的多视图剪枝待以上实验有数据后再评估。[#479](https://github.com/ArthurBrussee/brush/pull/479) · [#562](https://github.com/ArthurBrussee/brush/pull/562) · [#512](https://github.com/ArthurBrussee/brush/pull/512) · [#565](https://github.com/ArthurBrussee/brush/pull/565) · [#353](https://github.com/ArthurBrussee/brush/pull/353)
 
+### 分裂偏移决定
+
+单针渲染 A/B 中，紧凑偏移减少了侧视轮廓外 alpha，但把轮廓覆盖从 100% 降到约 86%–89%，并增加了轮廓内 alpha 误差。保留现有分裂偏移。可用 `cargo +1.100.0 test --locked -p brush-train --lib compare_needle_split_offsets -- --ignored --nocapture` 复现。
+
 ## 验收
 
 - 运行仓库格式、Clippy、原生测试和 WASM 编译。WGPU 单元测试、实际 Metal 训练和浏览器／桌面预览各自记录证据。编译通过只记录为编译结果。

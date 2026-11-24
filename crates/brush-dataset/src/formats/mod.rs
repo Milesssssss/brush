@@ -1,6 +1,6 @@
 use crate::{
     Dataset,
-    config::LoadDatasetConfig,
+    config::{DepthMode, LoadDatasetConfig},
     scene::{Scene, SceneView},
 };
 use brush_serde::{DeserializeError, SplatMessage, load_splat_from_ply};
@@ -65,6 +65,19 @@ pub async fn load_dataset(
     vfs: Arc<BrushVfs>,
     load_args: &LoadDatasetConfig,
 ) -> Result<DatasetLoadResult, DatasetError> {
+    let units_per_meter = load_args.units_per_meter;
+    if !(units_per_meter.is_finite() && units_per_meter > 0.0) {
+        return Err(FormatError::InvalidFormat(format!(
+            "units_per_meter must be a positive number, got {units_per_meter}"
+        ))
+        .into());
+    }
+    if load_args.depth_mode == DepthMode::RelativeInverse && load_args.estimate_metric_scale {
+        return Err(FormatError::InvalidFormat(
+            "--estimate-metric-scale requires --depth-mode metric".to_owned(),
+        )
+        .into());
+    }
     let mut dataset = colmap::load_dataset(vfs.clone(), load_args).await;
 
     if dataset.is_none() {
@@ -79,7 +92,7 @@ pub async fn load_dataset(
         return Err(DatasetError::FormatNotSupported);
     };
 
-    let result = dataset?;
+    let mut result = dataset?;
 
     // A dataset that parsed but has no usable training views (e.g. every image
     // was missing or filtered out) would otherwise "load" and then crash on the
@@ -90,6 +103,18 @@ pub async fn load_dataset(
                 .to_owned(),
         )
         .into());
+    }
+    if load_args.depth_mode == DepthMode::RelativeInverse
+        && result
+            .dataset
+            .train
+            .views
+            .iter()
+            .all(|view| view.depth.is_none())
+    {
+        result
+            .warnings
+            .push("No relative inverse-depth maps matched the training views".to_owned());
     }
 
     // If there's an initial ply file, override the init stream with that.
@@ -126,7 +151,7 @@ pub async fn load_dataset(
         warnings: result.warnings,
         metric_scale: result.metric_scale,
     };
-    scale_to_meters(result, load_args.units_per_meter)
+    Ok(scale_to_meters(result, units_per_meter))
 }
 
 /// Multiply an initializer's positions by `scale` and shift log-scales by `ln(scale)`.
@@ -149,18 +174,9 @@ fn apply_reconstruction_scale(splat: &mut SplatMessage, scale: f32) {
 /// by `units_per_meter`. Training then runs in metres, so metric thresholds
 /// mean the same thing on a millimetre scan as on a COLMAP scene; exports
 /// multiply back (see `Splats::scaled`).
-fn scale_to_meters(
-    mut result: DatasetLoadResult,
-    units_per_meter: f32,
-) -> Result<DatasetLoadResult, DatasetError> {
-    if !(units_per_meter.is_finite() && units_per_meter > 0.0) {
-        return Err(FormatError::InvalidFormat(format!(
-            "units_per_meter must be a positive number, got {units_per_meter}"
-        ))
-        .into());
-    }
+fn scale_to_meters(mut result: DatasetLoadResult, units_per_meter: f32) -> DatasetLoadResult {
     if units_per_meter == 1.0 {
-        return Ok(result);
+        return result;
     }
     let to_meters = 1.0 / units_per_meter;
 
@@ -192,7 +208,7 @@ fn scale_to_meters(
             }
         }
     }
-    Ok(result)
+    result
 }
 
 /// Resolve a bare image name (as stored by colmap / `RealityCapture`, which only

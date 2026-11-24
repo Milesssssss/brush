@@ -20,7 +20,9 @@
 //! across the autograd tape.
 
 mod depth_loss;
-pub use depth_loss::{expected_depth, inverse_depth_l1, inverse_depth_l1_mean};
+pub use depth_loss::{
+    expected_depth, inverse_depth_l1, inverse_depth_l1_mean, relative_inverse_depth_loss,
+};
 
 use brush_cube::create_tensor;
 use burn::backend::autodiff::checkpoint::strategy::CheckpointStrategy;

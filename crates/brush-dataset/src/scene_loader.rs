@@ -7,7 +7,7 @@ use tokio::sync::{Mutex, mpsc};
 
 use crate::{
     config::LoadDatasetConfig,
-    scene::{Scene, SceneBatch, view_to_packed_data},
+    scene::{DepthBatch, Scene, SceneBatch, view_to_packed_data},
 };
 
 /// Shared cache of GPU-ready scene batches. Each slot holds at most one
@@ -151,7 +151,10 @@ async fn run_loader(
             let [height, width] = [img_packed.shape()[0], img_packed.shape()[1]];
             let depth = if let Some(load_depth) = &view.depth {
                 match load_depth.load_resized(height, width).await {
-                    Ok(depth) => Some(depth),
+                    Ok(data) => Some(DepthBatch {
+                        mode: load_depth.mode(),
+                        data,
+                    }),
                     Err(err) => {
                         log::warn!("Skipping depth map {}: {err}", load_depth.path().display());
                         None
@@ -161,6 +164,7 @@ async fn run_loader(
                 None
             };
             let mut batch = SceneBatch {
+                view_index: index,
                 img_packed,
                 has_alpha,
                 alpha_mode: view.image.alpha_mode(),
@@ -173,7 +177,10 @@ async fn run_loader(
                 // Share the pixels before caching: this hand-off and every
                 // later hit then costs a refcount instead of a full copy.
                 batch.img_packed = share_tensor_data(batch.img_packed);
-                batch.depth = batch.depth.map(share_tensor_data);
+                batch.depth = batch.depth.map(|depth| DepthBatch {
+                    data: share_tensor_data(depth.data),
+                    ..depth
+                });
                 cache.insert(index, Arc::new(batch.clone()));
             }
             batch

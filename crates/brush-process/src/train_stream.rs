@@ -10,7 +10,7 @@ use brush_render::gaussian_splats::{SplatRenderMode, Splats};
 use brush_rerun::visualize_tools::VisualizeTools;
 use brush_train::{
     RandomSplatsConfig, create_random_splats,
-    eval::eval_stats,
+    eval::eval_stats_with_appearance,
     lod::{compute_pup_scores, decimate_to_count},
     msg::RefineStats,
     to_init_splats,
@@ -235,6 +235,14 @@ pub(crate) async fn train_stream(
         (trainer, process_config.start_iter)
     };
     trainer.set_view_cams(view_cams.clone());
+    trainer.set_appearance_views(
+        dataset
+            .train
+            .views
+            .iter()
+            .map(|v| v.image.path().to_owned()),
+        device,
+    );
 
     // Get the dataset name from the base path (if available) for interpolation.
     let dataset_name = vfs
@@ -347,13 +355,15 @@ pub(crate) async fn train_stream(
             }
 
             let bounds = get_splat_bounds(splats.clone(), BOUND_PERCENTILE).await;
-            trainer = SplatTrainer::new_seeded(
+            let mut lod_trainer = SplatTrainer::new_seeded(
                 &train_stream_config.train_config,
                 device,
                 bounds,
                 process_config.seed,
             );
-            trainer.set_view_cams(view_cams.clone());
+            lod_trainer.set_view_cams(view_cams.clone());
+            lod_trainer.carry_appearance_from(&mut trainer);
+            trainer = lod_trainer;
 
             log::info!(
                 "LOD {current_lod}/{lod_levels}: Training for {lod_refine_steps} steps (image scale {:.0}%)",
@@ -440,6 +450,7 @@ pub(crate) async fn train_stream(
                 device,
                 emitter,
                 &visualize,
+                &trainer,
                 splats.clone(),
                 iter,
                 eval_scene,
@@ -779,6 +790,7 @@ async fn run_eval(
     device: &burn::tensor::Device,
     emitter: &Emitter,
     visualize: &VisualizeTools,
+    trainer: &SplatTrainer,
     splats: Splats,
     iter: u32,
     eval_scene: &Scene,
@@ -789,28 +801,34 @@ async fn run_eval(
         return Ok(());
     }
 
-    let mut psnr = 0.0;
-    let mut ssim = 0.0;
-    let mut count = 0;
+    let mut held_out = (0, 0.0, 0.0);
+    let mut corrected = (0, 0.0, 0.0);
     log::info!("Running evaluation for iteration {iter}");
 
     for (i, view) in eval_scene.views.iter().enumerate() {
         brush_async::yield_now().await;
 
         let eval_img = view.image.load().await?;
-        let sample = eval_stats(
+        let appearance = trainer.appearance_for_view(view.image.path());
+        let totals = if appearance.is_some() {
+            &mut corrected
+        } else {
+            &mut held_out
+        };
+        let sample = eval_stats_with_appearance(
             splats.clone(),
             &view.camera,
             eval_img,
             view.image.alpha_mode(),
             device,
+            appearance,
         )
         .await
         .context("Failed to run eval for sample.")?;
 
-        count += 1;
-        psnr += sample.psnr.clone().into_scalar_async::<f32>().await?;
-        ssim += sample.ssim.clone().into_scalar_async::<f32>().await?;
+        totals.0 += 1;
+        totals.1 += sample.psnr.clone().into_scalar_async::<f32>().await?;
+        totals.2 += sample.ssim.clone().into_scalar_async::<f32>().await?;
 
         #[cfg(not(target_family = "wasm"))]
         if let Some(path) = &save_path {
@@ -833,8 +851,18 @@ async fn run_eval(
             .log_eval_sample(iter, i as u32, sample, rerun_max_img_size)
             .await?;
     }
-    psnr /= count as f32;
-    ssim /= count as f32;
+    if corrected.0 > 0 {
+        log::info!(
+            "Corrected training views ({}): PSNR {:.3}, SSIM {:.4}",
+            corrected.0,
+            corrected.1 / corrected.0 as f32,
+            corrected.2 / corrected.0 as f32,
+        );
+    }
+    // Prefer the uncorrected held-out scores whenever the dataset has them.
+    let (count, psnr, ssim) = if held_out.0 > 0 { held_out } else { corrected };
+    let psnr = psnr / count as f32;
+    let ssim = ssim / count as f32;
     visualize.log_eval_stats(iter, psnr, ssim)?;
     emitter
         .emit(ProcessMessage::TrainMessage(TrainMessage::EvalResult {

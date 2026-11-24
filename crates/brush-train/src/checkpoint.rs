@@ -21,6 +21,7 @@ use safetensors::{Dtype, SafeTensors, tensor::TensorView};
 
 use crate::{
     adam_scaled::MomentumState,
+    appearance::{Appearance, AppearanceViews},
     config::TrainConfig,
     train::{SplatOptim, SplatTrainer},
 };
@@ -41,6 +42,7 @@ const META_BOUNDS: &str = "brush.bounds";
 const META_ADAM_TIME_TRANSFORMS: &str = "brush.adam-time.transforms";
 const META_ADAM_TIME_SH: &str = "brush.adam-time.sh-coeffs";
 const META_ADAM_TIME_OPAC: &str = "brush.adam-time.opacities";
+const META_APPEARANCE_VIEWS: &str = "brush.appearance-views";
 /// Free-form entry holding the training arguments the checkpoint was written
 /// with, so a resume can warn when the configuration changed.
 pub const META_CONFIG_ARGS: &str = "brush.config-args";
@@ -55,6 +57,9 @@ const T_OPT_SH_M1: &str = "optim.sh_coeffs.moment_1";
 const T_OPT_SH_M2: &str = "optim.sh_coeffs.moment_2";
 const T_OPT_OPAC_M1: &str = "optim.raw_opacities.moment_1";
 const T_OPT_OPAC_M2: &str = "optim.raw_opacities.moment_2";
+const T_APPEARANCE: &str = "appearance.affine";
+const T_APPEARANCE_M1: &str = "appearance.moment_1";
+const T_APPEARANCE_M2: &str = "appearance.moment_2";
 
 /// A checkpoint loaded back into live training state.
 pub struct LoadedCheckpoint {
@@ -135,6 +140,22 @@ pub async fn checkpoint_to_bytes(
             entries.push((T_OPT_OPAC_M2, host_data(m.moment_2.clone()).await?));
             metadata.insert(META_ADAM_TIME_OPAC.to_owned(), m.time.to_string());
         }
+    }
+
+    if let Some(appearance) = &trainer.appearance {
+        metadata.insert(
+            META_APPEARANCE_VIEWS.to_owned(),
+            serde_json::to_string(&appearance.views)?,
+        );
+        entries.push((T_APPEARANCE, host_data(appearance.params.clone()).await?));
+        entries.push((
+            T_APPEARANCE_M1,
+            host_data(appearance.moment_1.clone()).await?,
+        ));
+        entries.push((
+            T_APPEARANCE_M2,
+            host_data(appearance.moment_2.clone()).await?,
+        ));
     }
 
     for (key, value) in extra_metadata {
@@ -319,6 +340,30 @@ pub fn checkpoint_from_bytes(
     }
     if any_momentum {
         trainer.optim = Some(optim);
+    }
+
+    if config.appearance_compensation
+        && let Some(views) = metadata.get(META_APPEARANCE_VIEWS)
+    {
+        let views: AppearanceViews = serde_json::from_str(views)?;
+        let n = views.paths.len();
+        anyhow::ensure!(
+            views.steps.len() == n,
+            "Checkpoint appearance steps do not match its views"
+        );
+        let params = tensor_from::<3>(&tensors, T_APPEARANCE, &opt_device)?;
+        let moment_1 = tensor_from::<3>(&tensors, T_APPEARANCE_M1, &opt_device)?;
+        let moment_2 = tensor_from::<3>(&tensors, T_APPEARANCE_M2, &opt_device)?;
+        anyhow::ensure!(
+            [params.dims(), moment_1.dims(), moment_2.dims()] == [[n, 4, 3]; 3],
+            "Checkpoint appearance tensors must be [views, 4, 3]",
+        );
+        trainer.appearance = Some(Appearance {
+            views,
+            params,
+            moment_1,
+            moment_2,
+        });
     }
 
     Ok(LoadedCheckpoint {

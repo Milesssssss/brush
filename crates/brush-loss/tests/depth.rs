@@ -1,7 +1,9 @@
 //! Inverse-depth loss and the detached depth normalisation, on a device.
 
-use brush_loss::{expected_depth, inverse_depth_l1, inverse_depth_l1_mean};
-use burn::tensor::Tensor;
+use brush_loss::{
+    expected_depth, inverse_depth_l1, inverse_depth_l1_mean, relative_inverse_depth_loss,
+};
+use burn::tensor::{Device, Tensor};
 
 #[tokio::test]
 async fn tensor_inverse_depth_matches_the_scalar_reduction() {
@@ -216,4 +218,81 @@ async fn expected_depth_detaches_alpha() {
         .try_to_vec::<f32>()
         .expect("f32");
     assert!(safe[0].is_finite());
+}
+
+async fn relative_result(
+    device: &Device,
+    depths: &[f32],
+    targets: &[f32],
+    mask: Option<&[f32]>,
+) -> (f32, Vec<f32>) {
+    let image =
+        |samples: &[f32]| Tensor::<1>::from_floats(samples, device).reshape([1, samples.len()]);
+    let pred = image(depths).require_grad();
+    let loss = relative_inverse_depth_loss(pred.clone(), image(targets), mask.map(image));
+    let value = loss.clone().into_scalar_async::<f32>().await.unwrap();
+    let grad = pred
+        .grad(&loss.backward())
+        .unwrap()
+        .into_data_async()
+        .await
+        .unwrap()
+        .try_to_vec::<f32>()
+        .unwrap();
+    (value, grad)
+}
+
+#[tokio::test]
+async fn relative_depth_fits_affine_disparity_and_keeps_partial_patches() {
+    let device = Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+    let depth = [
+        1.0, 2.0, 3.0, 4.0, 1.0, 2.0, 3.0, 4.0, 1.0, 2.0, 3.0, 2.0, 4.0,
+    ];
+    let matching = depth.map(|z| 4.0 / z - 1.5);
+    let (matched, _) = relative_result(&device, &depth, &matching, None).await;
+    assert_eq!(matched, 0.0);
+
+    // Only the partial patch disagrees. Dropping the border makes the loss zero.
+    let mut flipped_edge = matching;
+    flipped_edge.swap(11, 12);
+    let (loss, grad) = relative_result(&device, &depth, &flipped_edge, None).await;
+    assert!(loss > 0.2);
+    assert!(grad[11].abs() > 0.01 && grad[12].abs() > 0.01);
+
+    let shifted = flipped_edge.map(|d| d * 2.0 + 10.0);
+    let (transformed_loss, transformed_grad) =
+        relative_result(&device, &depth, &shifted, None).await;
+    assert!((loss - transformed_loss).abs() < 1e-5);
+    assert!(
+        grad.iter()
+            .zip(transformed_grad)
+            .all(|(a, b)| (a - b).abs() < 1e-5)
+    );
+}
+
+#[tokio::test]
+async fn relative_depth_mask_controls_statistics_and_empty_loss() {
+    let device = Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+    let depth = [1.0, 2.0, 4.0, 3.0, 1.0];
+    let targets = [-2.0, -1.0, 4.0, 2.0, f32::INFINITY];
+    let mask = [1.0, 0.5, 1.0, 0.0, 1.0];
+    let (loss, grad) = relative_result(&device, &depth, &targets, Some(&mask)).await;
+    assert!(loss > 0.2 && grad[0].abs() > 0.01);
+    assert_eq!((grad[3], grad[4]), (0.0, 0.0));
+
+    let changed = [-2.0, -1.0, 4.0, f32::MAX, f32::NAN];
+    let (changed_loss, changed_grad) =
+        relative_result(&device, &depth, &changed, Some(&mask)).await;
+    assert_eq!(loss, changed_loss);
+    assert_eq!(grad, changed_grad);
+
+    let zeros = [0.0; 5];
+    let (loss, grad) = relative_result(&device, &depth, &changed, Some(&zeros)).await;
+    assert_eq!(loss, 0.0);
+    assert_eq!(grad, zeros);
+
+    let fractional = [0.25, 0.39, 1.0, 0.0, 0.16];
+    let (loss, grad) = relative_result(&device, &depth, &[0.2; 5], Some(&fractional)).await;
+    assert_eq!(loss, 0.0);
+    assert_eq!(grad, zeros);
 }

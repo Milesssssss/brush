@@ -123,6 +123,7 @@ fn generate_test_batch(resolution: (u32, u32)) -> SceneBatch {
     );
 
     SceneBatch {
+        view_index: 0,
         img_packed,
         has_alpha: false,
         alpha_mode: AlphaMode::Transparent,
@@ -250,6 +251,7 @@ async fn train_with_zero_visible_does_not_crash() {
 
     let pixel = 0x80808080u32 as i32; // mid-grey, opaque; bit-cast to i32 for the dispatch backend
     let batch = SceneBatch {
+        view_index: 0,
         img_packed: TensorData::new(vec![pixel; 64 * 64], [64usize, 64]),
         has_alpha: false,
         alpha_mode: AlphaMode::Transparent,

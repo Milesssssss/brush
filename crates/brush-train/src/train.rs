@@ -1,7 +1,9 @@
 use std::f32::consts::FRAC_1_SQRT_2;
+use std::path::{Path, PathBuf};
 
 use crate::{
     adam_scaled::{AdamScaled, AdamState},
+    appearance::{Appearance, IDENTITY_WEIGHT, correct_image},
     config::TrainConfig,
     msg::{RefineStats, TrainStepStats},
     multinomial::multinomial_sample,
@@ -10,8 +12,10 @@ use crate::{
     split::{MIN_OPACITY, MIN_SPLIT_K, SPLIT_OPACITY_EPS},
     stats::RefineRecord,
 };
-use brush_dataset::scene::SceneBatch;
-use brush_loss::{ImageLossConfig, expected_depth, image_loss, inverse_depth_l1};
+use brush_dataset::{config::DepthMode, scene::SceneBatch};
+use brush_loss::{
+    ImageLossConfig, expected_depth, image_loss, inverse_depth_l1, relative_inverse_depth_loss,
+};
 use brush_render::bwd::render_splats_with_mode;
 use brush_render::gaussian_splats::{RasterPass, RasterizationMode, Splats};
 use brush_render::{AlphaMode, bounding_box::BoundingBox, sh::sh_coeffs_for_degree};
@@ -114,6 +118,7 @@ pub struct SplatTrainer {
     lr_mean_columns: Tensor<2>,
     refine_record: Option<RefineRecord>,
     pub(crate) optim: Option<SplatOptim>,
+    pub(crate) appearance: Option<Appearance>,
     ssim_enabled: bool,
     pub(crate) bounds: BoundingBox,
     pub(crate) step_count: u32,
@@ -280,6 +285,7 @@ impl SplatTrainer {
             lr_scaling_fixed,
             lr_mean_columns,
             optim: None,
+            appearance: None,
             refine_record: None,
             ssim_enabled,
             bounds,
@@ -346,6 +352,32 @@ impl SplatTrainer {
         self.view_cams = view_cams;
     }
 
+    /// Bind appearance rows to this dataset's training view order.
+    pub fn set_appearance_views(
+        &mut self,
+        paths: impl IntoIterator<Item = PathBuf>,
+        device: &Device,
+    ) {
+        if self.config.appearance_compensation {
+            let paths = paths.into_iter().collect();
+            if let Some(appearance) = &mut self.appearance {
+                appearance.set_views(paths);
+            } else {
+                self.appearance = Some(Appearance::new(paths, &device.clone().inner()));
+            }
+        }
+    }
+
+    /// Keep view corrections and their optimizer when restarting the splat optimizer for a LOD.
+    pub fn carry_appearance_from(&mut self, previous: &mut Self) {
+        self.appearance = previous.appearance.take();
+    }
+
+    /// The learned affine residual for the dataset-relative image path.
+    pub fn appearance_for_view(&self, path: &Path) -> Option<Tensor<2>> {
+        self.appearance.as_ref()?.for_view(path)
+    }
+
     /// Install refine statistics without a training step.
     ///
     /// Tests use this to drive split/prune from known screen sizes. Production
@@ -355,12 +387,12 @@ impl SplatTrainer {
         self.refine_record = Some(record);
     }
 
-    /// Drop the GPU-side optimizer momentum and refine statistics, e.g. ahead
-    /// of a memory compaction. Both re-initialize lazily on the next step, so
-    /// only call this when the state has been checkpointed (or is disposable).
+    /// Drop the GPU-side optimizer, refine and appearance state ahead of a
+    /// memory compaction. Save a checkpoint first if the state must survive.
     pub fn release_gpu_state(&mut self) {
         self.optim = None;
         self.refine_record = None;
+        self.appearance = None;
     }
 
     pub async fn step(&mut self, batch: SceneBatch, splats: Splats) -> (Splats, TrainStepStats) {
@@ -406,6 +438,10 @@ impl SplatTrainer {
         // The optimizer runs with base LR 1 and these per-column scales.
         let lr_scaling =
             self.lr_scaling_fixed.clone() + self.lr_mean_columns.clone() * lr_mean as f32;
+        let appearance_delta = self
+            .appearance
+            .as_ref()
+            .map(|appearance| appearance.for_training(batch.view_index));
 
         let (
             mut grads,
@@ -473,18 +509,21 @@ impl SplatTrainer {
                     0.0
                 },
             };
-            // The kernel takes the RGBA image as rendered.
-            // `loss` is only reassigned by the LPIPS path below, which is
-            // compiled out on wasm — so `mut` is unused there.
             // Depth renders append a 5th channel. The image loss still sees
-            // the original RGBA image, and only when depth is enabled.
+            // only RGBA, and appearance affects RGB without touching depth.
             let pred_for_loss = if use_depth {
                 pred_image.clone().slice(s![.., .., 0..4])
             } else {
                 pred_image.clone()
             };
-            #[cfg_attr(target_family = "wasm", allow(unused_mut))]
-            let mut loss = image_loss(pred_for_loss, gt_packed.clone(), cfg);
+            let pred_for_loss = match &appearance_delta {
+                Some(delta) => correct_image(pred_for_loss, delta.clone(), background),
+                None => pred_for_loss,
+            };
+            let mut loss = image_loss(pred_for_loss.clone(), gt_packed.clone(), cfg);
+            if let Some(delta) = &appearance_delta {
+                loss = loss + delta.clone().powi_scalar(2).mean() * IDENTITY_WEIGHT;
+            }
 
             // LPIPS still needs an f32 RGB tensor for VGG. Materialising it
             // here costs ~99 MB at 4K, only when LPIPS is enabled.
@@ -494,13 +533,13 @@ impl SplatTrainer {
                 let gt_rgb_diff: Tensor<3> = Tensor::from_inner(gt_rgb);
                 loss = loss
                     + lpips.lpips(
-                        pred_image.clone().slice(s![.., .., 0..3]).unsqueeze_dim(0),
+                        pred_for_loss.slice(s![.., .., 0..3]).unsqueeze_dim(0),
                         gt_rgb_diff.unsqueeze_dim(0),
                     ) * self.config.lpips_loss_weight;
             }
 
-            if use_depth && let Some(depth_data) = batch.depth.clone() {
-                let gt_depth = Tensor::<2>::from_data(depth_data, &device);
+            if use_depth && let Some(depth_data) = batch.depth {
+                let gt_depth = Tensor::<2>::from_data(depth_data.data, &device);
                 let accumulated = pred_image.clone().slice(s![.., .., 4..5]);
                 // Detach alpha in the quotient. The rasterizer also leaves the
                 // depth channel out of the alpha dot-accumulator, so depth
@@ -518,9 +557,13 @@ impl SplatTrainer {
                         .div_scalar(255.0);
                     Tensor::from_inner(alpha_byte)
                 });
-                loss = loss
-                    + inverse_depth_l1(rendered, gt_depth, depth_mask)
-                        * self.config.depth_loss_weight;
+                let depth_loss = match depth_data.mode {
+                    DepthMode::Metric => inverse_depth_l1(rendered, gt_depth, depth_mask),
+                    DepthMode::RelativeInverse => {
+                        relative_inverse_depth_loss(rendered, gt_depth, depth_mask)
+                    }
+                };
+                loss = loss + depth_loss * self.config.depth_loss_weight;
             }
 
             // Strip the autodiff graph off the loss so consumers can read the
@@ -593,6 +636,10 @@ impl SplatTrainer {
             });
             splats
         });
+
+        if let (Some(appearance), Some(delta)) = (&mut self.appearance, appearance_delta) {
+            appearance.update(batch.view_index, delta, &mut grads);
+        }
 
         trace_span!("Housekeeping").in_scope(|| {
             // Refine state accumulates on the inner (non-autodiff) device.

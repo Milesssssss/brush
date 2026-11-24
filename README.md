@@ -33,15 +33,16 @@ For practical guidance on CLI training flags (how to trade off run length, splat
 
 ### Depth supervision
 
-COLMAP datasets can include a `depth` folder of single-channel float32 TIFF depth maps, matched to the RGB images by file stem (`images/frame.png` pairs with `depth/frame.tiff`, or with the same relative subdirectory). A value of `0` marks an invalid pixel. Other dataset formats ignore these files. Depth samples are divided by `--units-per-meter` along with the cameras, so supervision stays in the same units as training. Scale estimation reads the files in their own units first, and samples each landmark at the matching position in the depth map when that map is not the COLMAP camera resolution.
+COLMAP datasets can include a `depth` folder of single-channel float32 TIFF depth maps, matched to the RGB images by file stem (`images/frame.png` pairs with `depth/frame.tiff`, or with the same relative subdirectory). Other dataset formats ignore these files.
 
-`--depth-loss-weight` (default `0`) adds an L1 loss on inverse depth, `mean(|1/rendered − 1/ground truth|)`, over the valid pixels. Leaving it at `0` keeps the existing training loss and the 4-channel render. The rendered depth is the alpha-weighted sum divided by accumulated alpha, and that alpha is detached so the loss moves gaussians instead of changing opacity.
+`--depth-loss-weight` defaults to `0`, which keeps the four-channel color render. The `--depth-mode` option controls how Brush interprets the TIFFs.
 
-COLMAP reconstructions have an arbitrary scale. `--estimate-metric-scale` (default off) estimates one global scale from the depth maps and the projected landmarks, then applies it to the camera positions and the initial point cloud. A PLY used as the initializer, including `init.ply`, is treated as being in that same original reconstruction frame: its means are multiplied by the scale and its log-scales shift by `ln(scale)`. It does nothing when the flag is off or when no depth maps are present. `--units-per-meter` is applied after that scale.
+- `metric` (default) expects positive finite camera Z in the dataset's units. Samples are divided by `--units-per-meter` along with the cameras. The loss is L1 on inverse depth over valid samples.
+- `relative-inverse` expects unitless inverse-depth predictions from an offline predictor. Larger values mean closer. Zero and negative values are valid, and non-finite values mark invalid pixels. The loss compares normalized local patches of rendered inverse depth and target values, with a second term using image-wide scales. TIFF values bypass metric unit conversion. `--estimate-metric-scale` requires metric depth.
 
-Masked views weight the depth loss by the same mask alpha as the RGB loss, so pixels outside the silhouette do not pull geometry.
+For metric maps, `--estimate-metric-scale` estimates one global scale from projected COLMAP landmarks. It samples in the depth map's resolution and scales the cameras and selected initializer, including an overriding `init.ply` in the same original reconstruction coordinates. `--units-per-meter` is applied afterwards.
 
-In the viewer, **Depth map** shows the rendered expected depth with a turbo colormap. In the dataset panel, **Depth** shows the loaded ground-truth map for the current view, with the same colormap.
+The depth loss uses alpha-weighted expected camera Z with blending weights held fixed during its backward pass. Masked views weight each depth contribution by the source mask alpha. In the viewer, **Depth map** shows rendered camera Z. In the dataset panel, **Depth** shows the paired TIFF values with the selected convention.
 
 ### Checkpoints
 

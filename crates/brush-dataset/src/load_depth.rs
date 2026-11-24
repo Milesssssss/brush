@@ -1,4 +1,4 @@
-//! Float32 TIFF depth maps. A value of `0` marks an invalid sample.
+//! Float32 TIFF depth maps.
 
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
@@ -9,36 +9,45 @@ use burn::tensor::TensorData;
 use thiserror::Error;
 use tokio::io::AsyncReadExt;
 
-use crate::depth::resample_nearest;
+use crate::{config::DepthMode, depth::resample_nearest};
 
 /// Lazily loaded per-view depth map.
 ///
-/// `to_scene` converts file samples into the units training uses
-/// (`1 / units_per_meter`). Scale estimation reads [`Self::load_native`],
-/// which stays in the file's own units.
+/// Metric samples are converted into training units. Relative samples and
+/// samples read for metric scale estimation keep their file values.
 #[derive(Clone, Debug)]
 pub struct LoadDepth {
     vfs: Arc<BrushVfs>,
     path: PathBuf,
+    mode: DepthMode,
     to_scene: f32,
 }
 
 impl LoadDepth {
-    pub fn new(vfs: Arc<BrushVfs>, path: PathBuf, units_per_meter: f32) -> Self {
-        let to_scene = if units_per_meter.is_finite() && units_per_meter > 0.0 {
-            1.0 / units_per_meter
-        } else {
-            1.0
+    pub(crate) fn new(
+        vfs: Arc<BrushVfs>,
+        path: PathBuf,
+        mode: DepthMode,
+        units_per_meter: f32,
+    ) -> Self {
+        let to_scene = match mode {
+            DepthMode::Metric => 1.0 / units_per_meter,
+            DepthMode::RelativeInverse => 1.0,
         };
         Self {
             vfs,
             path,
+            mode,
             to_scene,
         }
     }
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub fn mode(&self) -> DepthMode {
+        self.mode
     }
 
     /// Decode the file at its native resolution, in the file's own units.
@@ -52,8 +61,8 @@ impl LoadDepth {
         decode_f32_tiff(&bytes)
     }
 
-    /// [`Self::load_native`] multiplied into the training scene's units.
-    pub async fn load_in_scene_units(&self) -> Result<(Vec<f32>, usize, usize), LoadDepthError> {
+    /// Decode, converting metric values into the training scene's units.
+    pub async fn load_values(&self) -> Result<(Vec<f32>, usize, usize), LoadDepthError> {
         let (mut samples, width, height) = self.load_native().await?;
         if self.to_scene != 1.0 {
             for sample in &mut samples {
@@ -63,7 +72,7 @@ impl LoadDepth {
         Ok((samples, width, height))
     }
 
-    /// Decode, convert into scene units, and nearest-resample to `[height, width]`.
+    /// Decode and nearest-resample to `[height, width]`.
     pub async fn load_resized(
         &self,
         height: usize,
@@ -74,7 +83,7 @@ impl LoadDepth {
                 "depth target size must be non-zero".to_owned(),
             ));
         }
-        let (samples, src_w, src_h) = self.load_in_scene_units().await?;
+        let (samples, src_w, src_h) = self.load_values().await?;
         let samples = resample_nearest(&samples, src_w, src_h, width, height);
         Ok(TensorData::new(samples, [height, width]))
     }

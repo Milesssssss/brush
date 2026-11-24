@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 use brush_dataset::{
     Dataset,
+    config::DepthMode,
     depth::{colorize_depth, resample_nearest},
     scene::{LoadDepth, LoadImage, Scene, SceneView, ViewType},
 };
@@ -154,8 +155,7 @@ impl PreviewLoader {
 struct DepthFrame {
     path: PathBuf,
     tex: TexHandle,
-    min: f32,
-    max: f32,
+    range: Option<(f32, f32)>,
 }
 
 struct DepthJob {
@@ -229,7 +229,7 @@ impl DepthPreviewLoader {
 
 async fn load_depth_preview(depth: LoadDepth, ctx: egui::Context, edge: u32) -> Option<DepthFrame> {
     let path = depth.path().to_path_buf();
-    let (samples, width, height) = depth.load_in_scene_units().await.ok()?;
+    let (samples, width, height) = depth.load_values().await.ok()?;
     let long_edge = width.max(height).max(1);
     let (preview, preview_w, preview_h) = if long_edge > edge as usize {
         let scale = edge as f32 / long_edge as f32;
@@ -243,7 +243,7 @@ async fn load_depth_preview(depth: LoadDepth, ctx: egui::Context, edge: u32) -> 
     } else {
         (samples, width, height)
     };
-    let colored = colorize_depth(&preview, preview_w, preview_h);
+    let colored = colorize_depth(&preview, preview_w, preview_h, depth.mode());
     let image = egui::ColorImage::from_rgba_unmultiplied([preview_w, preview_h], &colored.rgba);
     let handle = ctx.load_texture(
         path.to_string_lossy().into_owned(),
@@ -257,8 +257,7 @@ async fn load_depth_preview(depth: LoadDepth, ctx: egui::Context, edge: u32) -> 
             has_alpha: true,
             train_size: (width as u32, height as u32),
         },
-        min: colored.min,
-        max: colored.max,
+        range: colored.range,
     })
 }
 
@@ -370,7 +369,13 @@ impl DatasetPanel {
             egui::Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
             Color32::WHITE,
         );
-        draw_depth_colorbar(ui, full_rect, frame.min, frame.max);
+        if let Some((min, max)) = frame.range {
+            let label = match depth.mode() {
+                DepthMode::Metric => "Camera Z (scene units)",
+                DepthMode::RelativeInverse => "Relative inverse depth (unitless)",
+            };
+            draw_depth_colorbar(ui, full_rect, min, max, label);
+        }
         ui.allocate_rect(full_rect, egui::Sense::click());
     }
 

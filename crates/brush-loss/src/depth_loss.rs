@@ -4,7 +4,10 @@
 //! recovers expected depth, but that denominator is detached: depth error
 //! must move gaussians, not change how opaque they are.
 
-use burn::tensor::{Bool, Tensor};
+use burn::tensor::{Bool, Tensor, ops::PadMode};
+
+const PATCH_SIZE: usize = 11;
+const DEPTH_MARGIN: f32 = 0.2;
 
 /// Mean absolute error between inverse depths.
 ///
@@ -84,6 +87,102 @@ fn positive_finite(values: Tensor<2>) -> Tensor<2, Bool> {
         .clone()
         .greater_elem(0.0)
         .bool_and(values.lower_equal_elem(f32::MAX))
+}
+
+/// Local and image-normalized supervision for unitless, near-high inverse depth.
+/// The same weights define the statistics and the loss, so masked samples
+/// cannot influence other pixels through normalization.
+pub fn relative_inverse_depth_loss(
+    pred_depth: Tensor<2>,
+    target_inverse_depth: Tensor<2>,
+    mask: Option<Tensor<2>>,
+) -> Tensor<1> {
+    let finite_target = target_inverse_depth
+        .clone()
+        .greater_equal_elem(-f32::MAX)
+        .bool_and(target_inverse_depth.clone().lower_equal_elem(f32::MAX));
+    let valid = positive_finite(pred_depth.clone()).bool_and(finite_target);
+    let mut weights = valid.float();
+    if let Some(mask) = mask {
+        weights = weights * mask;
+    }
+    let excluded = weights.clone().equal_elem(0.0);
+    let pred = pred_depth.mask_fill(excluded.clone(), 1.0).recip();
+    let target = target_inverse_depth.mask_fill(excluded, 0.0);
+
+    let weight_patches = depth_patches(weights);
+    let image_weights = weight_patches.clone().reshape([1, -1]);
+    let (pred_local, pred_global, pred_std) =
+        normalized_depth(pred, &weight_patches, &image_weights);
+    let (target_local, target_global, target_std) =
+        normalized_depth(target, &weight_patches, &image_weights);
+    let variable = pred_std
+        .greater_elem(0.0)
+        .bool_and(target_std.greater_elem(0.0));
+    let weights = weight_patches * variable.float();
+
+    0.1 * margin_l2(pred_local - target_local, weights.clone())
+        + margin_l2(pred_global - target_global, weights)
+}
+
+fn depth_patches(values: Tensor<2>) -> Tensor<2> {
+    let [height, width] = values.dims();
+    let patch_rows = height.div_ceil(PATCH_SIZE);
+    let patch_cols = width.div_ceil(PATCH_SIZE);
+    values
+        .pad(
+            [
+                (0, patch_rows * PATCH_SIZE - height),
+                (0, patch_cols * PATCH_SIZE - width),
+            ],
+            PadMode::Constant(0.0),
+        )
+        .reshape([patch_rows, PATCH_SIZE, patch_cols, PATCH_SIZE])
+        .permute([0, 2, 1, 3])
+        .reshape([patch_rows * patch_cols, PATCH_SIZE * PATCH_SIZE])
+}
+
+fn normalized_depth(
+    values: Tensor<2>,
+    weight_patches: &Tensor<2>,
+    image_weights: &Tensor<2>,
+) -> (Tensor<2>, Tensor<2>, Tensor<2>) {
+    let patches = depth_patches(values);
+    let (_, image_std) = weighted_depth_stats(patches.clone().reshape([1, -1]), image_weights);
+    let (centered, patch_std) = weighted_depth_stats(patches, weight_patches);
+    let local_std = patch_std + image_std.clone() * 0.01;
+    let global_std = image_std.clone().detach() * 1.01;
+    (
+        centered.clone() / nonzero(local_std),
+        centered / nonzero(global_std),
+        image_std,
+    )
+}
+
+fn weighted_depth_stats(values: Tensor<2>, weights: &Tensor<2>) -> (Tensor<2>, Tensor<2>) {
+    // Center relative to a covered sample first. A flat patch then has exact
+    // zero variance even with fractional weights and a rounded weighted mean.
+    let pivot = values.clone().gather(1, weights.clone().argmax(1)).detach();
+    let values = values - pivot;
+    let count = nonzero(weights.clone().sum_dim(1));
+    let mean = (values.clone() * weights.clone()).sum_dim(1) / count.clone();
+    let centered = (values - mean).mask_fill(weights.clone().equal_elem(0.0), 0.0);
+    let var = (centered.clone().powi_scalar(2) * weights.clone()).sum_dim(1) / count;
+    // A zero variance has zero derivative here; sqrt's derivative is singular
+    // at zero even if a later normalization denominator is regularized.
+    let zero = var.clone().equal_elem(0.0);
+    let std = var.mask_fill(zero.clone(), 1.0).sqrt().mask_fill(zero, 0.0);
+    (centered, std)
+}
+
+fn margin_l2(error: Tensor<2>, weights: Tensor<2>) -> Tensor<1> {
+    let weights = weights.mask_fill(error.clone().abs().lower_equal_elem(DEPTH_MARGIN), 0.0);
+    (error.powi_scalar(2) * weights.clone()).sum() / nonzero(weights.sum())
+}
+
+fn nonzero<const D: usize>(value: Tensor<D>) -> Tensor<D> {
+    let zero = value.clone().equal_elem(0.0);
+    value.mask_fill(zero, 1.0)
 }
 
 /// `accumulated / alpha`, with alpha detached.
