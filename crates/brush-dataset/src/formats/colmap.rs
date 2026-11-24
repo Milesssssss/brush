@@ -962,9 +962,8 @@ mod tests {
         );
     }
 
-    /// Camera is 8×6. The landmark sits at camera pixel (2, 2), which is
-    /// depth pixel (1, 1) on the 4×3 map. Indexing the map with (2, 2) would
-    /// read a zero and drop the correspondence.
+    /// The landmark projects to (3.5, 3.5) in the 8×6 camera, or (1.75, 1.75)
+    /// on its 4×3 depth map. The adjacent pixel (2, 2) is on another surface.
     #[tokio::test]
     async fn metric_scale_samples_landmarks_in_depth_map_pixels() {
         let dir = tempfile::tempdir().unwrap();
@@ -984,7 +983,7 @@ mod tests {
              #   IMAGE_ID, QW, QX, QY, QZ, TX, TY, TZ, CAMERA_ID, NAME\n\
              #   POINTS2D[] as (X, Y, POINT3D_ID)\n\
              1 1 0 0 0 0 0 -5 1 view.png\n\
-             2 2 1\n",
+             3.5 3.5 1\n",
         )
         .await
         .unwrap();
@@ -992,7 +991,7 @@ mod tests {
             sparse.join("points3D.txt"),
             "# 3D point list with one line of data per point:\n\
              #   POINT3D_ID, X, Y, Z, R, G, B, ERROR, TRACK[] as (IMAGE_ID, POINT2D_IDX)\n\
-             1 0 0 10 255 0 0 0.1 1 0\n",
+             1 -0.3125 0.3125 10 255 0 0 0.1 1 0\n",
         )
         .await
         .unwrap();
@@ -1003,6 +1002,7 @@ mod tests {
             .unwrap();
         let mut samples = vec![0.0f32; 4 * 3];
         samples[5] = 10.0;
+        samples[10] = 40.0;
         let mut bytes = std::io::Cursor::new(Vec::new());
         tiff::encoder::TiffEncoder::new(&mut bytes)
             .unwrap()
@@ -1028,6 +1028,7 @@ mod tests {
             "warnings: {:?}",
             scaled.warnings
         );
+        assert_eq!(scaled.metric_scale, Some(2.0));
         assert_vec3_close(
             scaled.dataset.train.views[0].camera.position,
             glam::vec3(0.0, 0.0, 10.0),

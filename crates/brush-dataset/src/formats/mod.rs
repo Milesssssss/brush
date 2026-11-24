@@ -8,7 +8,7 @@ use brush_serde::{DeserializeError, SplatMessage, load_splat_from_ply};
 use brush_vfs::BrushVfs;
 use image::ImageError;
 use itertools::{Either, Itertools};
-use std::{path::Path, sync::Arc};
+use std::{cmp::Reverse, path::Path, sync::Arc};
 
 pub mod colmap;
 pub mod nerfstudio;
@@ -265,28 +265,34 @@ pub(crate) fn find_points3d_path<'a>(
 
 /// Locate a per-image depth map in a `depth` directory, matched by stem.
 ///
-/// `images/foo/bar.png` matches `depth/foo/bar.tiff` and `depth/bar.tiff`.
+/// `images/foo/bar.png` prefers `depth/foo/bar.tiff` over `depth/bar.tiff`.
 pub(crate) fn find_depth_path<'a>(vfs: &'a BrushVfs, path: &'a Path) -> Option<&'a Path> {
-    let search_name = path.file_name().expect("File must have a name");
-    let search_stem = path.file_stem().expect("File must have a name");
+    let search_name = path.file_name()?;
+    let search_stem = path.file_stem()?;
+    let path_dir_components: Vec<_> = path.parent()?.components().collect();
 
-    vfs.iter_files().find(|candidate| {
-        let Some(stem) = candidate.file_stem() else {
-            return false;
-        };
-        if !(stem.eq_ignore_ascii_case(search_name) || stem.eq_ignore_ascii_case(search_stem)) {
-            return false;
-        }
-        let depth_idx = candidate
-            .components()
-            .position(|c| c.as_os_str().eq_ignore_ascii_case("depth"));
-        depth_idx.is_some_and(|idx| {
-            let candidate_components: Vec<_> = candidate.components().collect();
-            let path_dir_components: Vec<_> = path.parent().unwrap().components().collect();
-            let depth_dir_subpath = &candidate_components[idx + 1..candidate_components.len() - 1];
-            path_dir_components.ends_with(depth_dir_subpath)
+    vfs.iter_files()
+        .filter_map(|candidate| {
+            let ext = candidate.extension()?;
+            if !(ext.eq_ignore_ascii_case("tif") || ext.eq_ignore_ascii_case("tiff")) {
+                return None;
+            }
+            let stem = candidate.file_stem()?;
+            let full_name = stem.eq_ignore_ascii_case(search_name);
+            if !full_name && !stem.eq_ignore_ascii_case(search_stem) {
+                return None;
+            }
+            let dirs: Vec<_> = candidate.parent()?.components().collect();
+            let depth_idx = dirs
+                .iter()
+                .position(|c| c.as_os_str().eq_ignore_ascii_case("depth"))?;
+            let subpath = &dirs[depth_idx + 1..];
+            path_dir_components
+                .ends_with(subpath)
+                .then_some((Reverse((subpath.len(), full_name)), candidate))
         })
-    })
+        .min()
+        .map(|(_, candidate)| candidate)
 }
 
 fn find_mask_path<'a>(vfs: &'a BrushVfs, path: &'a Path) -> Option<&'a Path> {
@@ -404,12 +410,20 @@ mod tests {
     fn test_find_depth_by_stem() {
         let vfs = BrushVfs::create_test_vfs(vec![
             PathBuf::from("images/foo/bar.png"),
-            PathBuf::from("depth/foo/bar.tiff"),
+            PathBuf::from("images/baz/bar.png"),
             PathBuf::from("images/other.png"),
+            PathBuf::from("depth/foo/bar.png"),
+            PathBuf::from("depth/foo/bar.png.TIF"),
+            PathBuf::from("depth/bar.TIFF"),
+            PathBuf::from("depth/other.png"),
         ]);
         assert_eq!(
             find_depth_path(&vfs, Path::new("images/foo/bar.png")),
-            Some(Path::new("depth/foo/bar.tiff"))
+            Some(Path::new("depth/foo/bar.png.TIF"))
+        );
+        assert_eq!(
+            find_depth_path(&vfs, Path::new("images/baz/bar.png")),
+            Some(Path::new("depth/bar.TIFF"))
         );
         assert_eq!(find_depth_path(&vfs, Path::new("images/other.png")), None);
 

@@ -82,7 +82,9 @@ impl Appearance {
 
     pub fn for_view(&self, path: &Path) -> Option<Tensor<2>> {
         let index = self.views.paths.iter().position(|p| p == path)?;
-        (self.views.steps[index] > 0).then(|| affine_row(&self.params, index))
+        // Evaluation identifies training views by membership, including rows
+        // that have not been sampled and still carry the identity transform.
+        Some(affine_row(&self.params, index))
     }
 
     pub fn update(&mut self, index: usize, delta: Tensor<2>, grads: &mut Gradients) {

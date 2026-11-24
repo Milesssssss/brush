@@ -120,8 +120,8 @@ pub fn resample_nearest(
 /// Map a COLMAP landmark from reconstruction pixels into a depth map.
 ///
 /// `xy` is in the camera's recorded width and height. A depth map at another
-/// resolution is sampled at the same fractional position, rounded to the
-/// nearest depth pixel. `None` when the mapped pixel is outside the map.
+/// resolution is sampled at the same fractional position. COLMAP coordinates
+/// are measured from the image corner, so pixel `i` is centered at `i + 0.5`.
 pub fn depth_pixel_for_landmark(
     xy: glam::Vec2,
     camera_width: u32,
@@ -143,8 +143,8 @@ pub fn depth_pixel_for_landmark(
     if !u.is_finite() || !v.is_finite() || u < 0.0 || v < 0.0 {
         return None;
     }
-    let u = u.round() as usize;
-    let v = v.round() as usize;
+    let u = u.floor() as usize;
+    let v = v.floor() as usize;
     (u < depth_width && v < depth_height).then_some((u, v))
 }
 
@@ -238,14 +238,17 @@ mod tests {
 
     #[test]
     fn landmark_pixels_scale_into_the_depth_map() {
-        // Same resolution: the landmark pixel is unchanged.
+        // Pixel centers on the matching grid use half-integer coordinates.
         assert_eq!(
-            depth_pixel_for_landmark(glam::vec2(1.0, 1.0), 4, 3, 4, 3),
-            Some((1, 1))
+            depth_pixel_for_landmark(glam::vec2(0.5, 0.5), 4, 3, 4, 3),
+            Some((0, 0))
         );
-        // Half resolution: camera pixel (2, 2) on an 8×6 image is depth pixel (1, 1).
         assert_eq!(
-            depth_pixel_for_landmark(glam::vec2(2.0, 2.0), 8, 6, 4, 3),
+            depth_pixel_for_landmark(glam::vec2(3.5, 2.5), 4, 3, 4, 3),
+            Some((3, 2))
+        );
+        assert_eq!(
+            depth_pixel_for_landmark(glam::vec2(3.5, 3.5), 8, 6, 4, 3),
             Some((1, 1))
         );
         // Indexing the half-resolution map with the raw camera pixel is outside it.
@@ -254,6 +257,7 @@ mod tests {
             Some((1, 1))
         );
         assert!(depth_pixel_for_landmark(glam::vec2(-1.0, 0.0), 4, 3, 4, 3).is_none());
+        assert!(depth_pixel_for_landmark(glam::vec2(4.0, 2.5), 4, 3, 4, 3).is_none());
     }
 
     #[test]

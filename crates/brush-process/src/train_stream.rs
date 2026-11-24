@@ -853,7 +853,7 @@ async fn run_eval(
     }
     if corrected.0 > 0 {
         log::info!(
-            "Corrected training views ({}): PSNR {:.3}, SSIM {:.4}",
+            "Training views with appearance compensation ({}): PSNR {:.3}, SSIM {:.4}",
             corrected.0,
             corrected.1 / corrected.0 as f32,
             corrected.2 / corrected.0 as f32,

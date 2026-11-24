@@ -511,16 +511,46 @@ impl SplatTrainer {
             };
             // Depth renders append a 5th channel. The image loss still sees
             // only RGBA, and appearance affects RGB without touching depth.
-            let pred_for_loss = if use_depth {
+            let raw_rgba = if use_depth {
                 pred_image.clone().slice(s![.., .., 0..4])
             } else {
                 pred_image.clone()
             };
             let pred_for_loss = match &appearance_delta {
-                Some(delta) => correct_image(pred_for_loss, delta.clone(), background),
-                None => pred_for_loss,
+                Some(delta) => correct_image(raw_rgba.clone(), delta.clone(), background),
+                None => raw_rgba.clone(),
             };
-            let mut loss = image_loss(pred_for_loss.clone(), gt_packed.clone(), cfg);
+            let mask_ssim = appearance_delta.is_some() && self.ssim_enabled;
+            #[cfg(not(target_family = "wasm"))]
+            let mask_lpips = appearance_delta.is_some() && self.lpips.is_some();
+            #[cfg(target_family = "wasm")]
+            let mask_lpips = false;
+            let supervision_mask =
+                (masked_alpha && (use_depth || mask_ssim || mask_lpips)).then(|| {
+                    let alpha_byte = gt_packed
+                        .clone()
+                        .bitwise_right_shift_scalar(24)
+                        .bitwise_and_scalar(0xFF)
+                        .float()
+                        .div_scalar(255.0);
+                    Tensor::from_inner(alpha_byte)
+                });
+            let (loss_pred, loss_gt) =
+                if let Some(mask) = supervision_mask.as_ref().filter(|_| mask_ssim) {
+                    // SSIM reads neighboring pixels before weighting the center.
+                    // Keep the geometry's rendered context, without using an
+                    // excluded source color or training the affine at that pixel.
+                    let excluded = mask.clone().equal_elem(0.0);
+                    (
+                        pred_for_loss
+                            .clone()
+                            .mask_where(excluded.clone().unsqueeze_dim(2), raw_rgba),
+                        gt_packed.clone().mask_fill(excluded.inner(), 0),
+                    )
+                } else {
+                    (pred_for_loss.clone(), gt_packed.clone())
+                };
+            let mut loss = image_loss(loss_pred, loss_gt, cfg);
             if let (Some(appearance), Some(delta)) = (&self.appearance, &appearance_delta) {
                 loss = loss + appearance.regularization(delta);
             }
@@ -529,13 +559,19 @@ impl SplatTrainer {
             // here costs ~99 MB at 4K, only when LPIPS is enabled.
             #[cfg(not(target_family = "wasm"))]
             if let Some(lpips) = &self.lpips {
-                let gt_rgb = brush_loss::unpack_gt_rgb(gt_packed.clone(), composite_bg);
-                let gt_rgb_diff: Tensor<3> = Tensor::from_inner(gt_rgb);
+                let pred_rgb = pred_for_loss.slice(s![.., .., 0..3]);
+                let gt_rgb = Tensor::from_inner(brush_loss::unpack_gt_rgb(gt_packed, composite_bg));
+                // Mask both inputs before VGG mixes neighboring pixels.
+                let (pred_rgb, gt_rgb) =
+                    if let Some(mask) = supervision_mask.as_ref().filter(|_| mask_lpips) {
+                        let mask = mask.clone().unsqueeze_dim(2);
+                        (pred_rgb * mask.clone(), gt_rgb * mask)
+                    } else {
+                        (pred_rgb, gt_rgb)
+                    };
                 loss = loss
-                    + lpips.lpips(
-                        pred_for_loss.slice(s![.., .., 0..3]).unsqueeze_dim(0),
-                        gt_rgb_diff.unsqueeze_dim(0),
-                    ) * self.config.lpips_loss_weight;
+                    + lpips.lpips(pred_rgb.unsqueeze_dim(0), gt_rgb.unsqueeze_dim(0))
+                        * self.config.lpips_loss_weight;
             }
 
             if use_depth && let Some(depth_data) = batch.depth {
@@ -546,21 +582,10 @@ impl SplatTrainer {
                 // error cannot be reduced by changing opacity.
                 let alpha = pred_image.clone().slice(s![.., .., 3..4]);
                 let rendered = expected_depth(accumulated, alpha).reshape([img_h, img_w]);
-                // Masked views already ignore RGB outside the silhouette. Depth
-                // uses the same alpha byte as a per-pixel weight.
-                let depth_mask = masked_alpha.then(|| {
-                    let alpha_byte = gt_packed
-                        .clone()
-                        .bitwise_right_shift_scalar(24)
-                        .bitwise_and_scalar(0xFF)
-                        .float()
-                        .div_scalar(255.0);
-                    Tensor::from_inner(alpha_byte)
-                });
                 let depth_loss = match depth_data.mode {
-                    DepthMode::Metric => inverse_depth_l1(rendered, gt_depth, depth_mask),
+                    DepthMode::Metric => inverse_depth_l1(rendered, gt_depth, supervision_mask),
                     DepthMode::RelativeInverse => {
-                        relative_inverse_depth_loss(rendered, gt_depth, depth_mask)
+                        relative_inverse_depth_loss(rendered, gt_depth, supervision_mask)
                     }
                 };
                 loss = loss + depth_loss * self.config.depth_loss_weight;

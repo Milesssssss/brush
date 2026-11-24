@@ -167,13 +167,15 @@ async fn trainer_learns_an_exposure_change_and_resumes_by_image_path() {
         (splats, _) = trainer.step(train_batch.clone(), splats).await;
     }
 
-    assert!(
-        trainer.appearance_for_view(&other).is_none(),
-        "same basename in another directory must keep identity"
-    );
     assert_close(
-        &values(affine_row(&trainer.appearance.as_ref().unwrap().params, 1)).await,
+        &values(trainer.appearance_for_view(&other).unwrap()).await,
         &[0.0; 12],
+    );
+    assert!(
+        trainer
+            .appearance_for_view(Path::new("held-out/exposed.png"))
+            .is_none(),
+        "a held-out path with the same basename must stay outside the training-view group"
     );
     let corrected = eval_stats_with_appearance(
         splats.clone().valid(),
@@ -223,12 +225,8 @@ async fn trainer_learns_an_exposure_change_and_resumes_by_image_path() {
 
     let new_view = PathBuf::from("images/new.png");
     resumed.set_appearance_views(vec![other, frame, new_view.clone()], &device);
-    assert!(
-        resumed.appearance_for_view(&new_view).is_none(),
-        "unknown path starts at identity"
-    );
     assert_close(
-        &values(affine_row(&resumed.appearance.as_ref().unwrap().params, 2)).await,
+        &values(resumed.appearance_for_view(&new_view).unwrap()).await,
         &[0.0; 12],
     );
 }
@@ -237,6 +235,13 @@ async fn trainer_learns_an_exposure_change_and_resumes_by_image_path() {
 async fn masked_background_color_does_not_train_appearance() {
     let device = Device::from(brush_cube::test_helpers::test_device().await).autodiff();
     let (splats, camera, config, bounds) = fixture(&device);
+    let config = TrainConfig {
+        ssim_weight: TrainConfig::default().ssim_weight,
+        background_color: vec![0.2, 0.1, 0.3],
+        #[cfg(not(target_family = "wasm"))]
+        lpips_loss_weight: 0.5,
+        ..config
+    };
     let path = PathBuf::from("images/masked.png");
     let mut first = SplatTrainer::new(&config, &device, bounds);
     let mut second = SplatTrainer::new(&config, &device, bounds);
@@ -245,7 +250,7 @@ async fn masked_background_color_does_not_train_appearance() {
     let image = |background| {
         DynamicImage::ImageRgba8(RgbaImage::from_fn(SIZE, SIZE, |x, y| {
             if (4..12).contains(&x) && (4..12).contains(&y) {
-                Rgba([130, 42, 110, 255])
+                Rgba([130, 42, 110, if x == 4 { 128 } else { 255 }])
             } else {
                 Rgba([background, background, background, 0])
             }
@@ -257,10 +262,11 @@ async fn masked_background_color_does_not_train_appearance() {
             splats.clone(),
         )
         .await;
-    let _ = second
+    let (_, second_stats) = second
         .step(batch(image(255), camera, AlphaMode::Masked, 0), splats)
         .await;
     assert!(stats.num_visible > 0, "the masked fixture must render");
+    assert_close(&values(stats.loss).await, &values(second_stats.loss).await);
     let first_delta = values(first.appearance_for_view(&path).unwrap()).await;
     assert!(
         first_delta.iter().any(|v| v.abs() > 1e-3),
